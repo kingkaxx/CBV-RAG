@@ -252,3 +252,11 @@ if __name__ != "__main__":
         init_config()
     except Exception as e:
         print(f"Warning: Config initialization failed: {e}")
+# CBV-RAG defaults
+MAX_CONTEXT_CHUNKS = 8
+MAX_CONTEXT_TOKENS = 1500
+RETRIEVAL_POOL_K0 = 50
+RERANK_BATCH_SIZE = 32
+CBVRAG_MAX_STEPS = 8
+CBVRAG_MAX_BRANCHES = 3
+CBVRAG_MAX_RETRIEVAL_CALLS = 5
