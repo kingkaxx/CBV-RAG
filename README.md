@@ -1,175 +1,211 @@
-# CF-RAG: Counterfactual-Driven Retrieval-Augmented Generation
+# CBV-RAG / CF-RAG
 
-## Overview
+This repository contains a **CF-RAG** implementation (counterfactual retrieval-augmented generation) and a newer **CBV-RAG scaffold** for budget-aware, branch-based retrieval + verification with an RL-friendly control loop.
 
-CF-RAG is a new framework that enhances Retrieval-Augmented Generation (RAG) with causal reasoning to overcome a critical vulnerability in existing systems: the Correlation Trap.
+> Current status:
+> - CF-RAG pipeline is runnable and integrated with dataset loaders/evaluation scripts.
+> - CBV-RAG modules are implemented as a modular scaffold (tools, env, heuristic controller, RL scripts) and are intended for iterative experimentation.
 
+---
 
-## Supported Datasets
+## 1) What is in this repository
 
-CF-RAG has been evaluated on multiple benchmark datasets:
+### CF-RAG (existing pipeline)
+- Counterfactual query generation.
+- Synergetic retrieval over original + counterfactual queries.
+- Evidence clustering/sampling and explanatory answer generation.
+- Interactive CLI (`main.py`) and dataset evaluation scripts.
 
-- **HotpotQA**: Multi-hop question answering dataset
-- **TriviaQA**: Trivia question answering with evidence passages
-- **PopQA**: Popular entity-centric question answering
-- **MusiQue**: Multi-step question answering requiring reasoning
-- **PubHealth**: Health claim verification dataset
+Key files:
+- `cfrag_pipeline.py`
+- `retriever.py`
+- `main.py`
+- `run_evaluation.py`
 
+### CBV-RAG (new scaffold)
+- Token/cost instrumentation (`metrics/`).
+- Modular tools (`tools/`) for LLM generation, retrieval, reranking, and context selection.
+- Branch/state/action runtime (`cbvrag/`) with Gym-like environment and heuristic controller.
+- RL data collection + policy training/evaluation scripts (`rl/`).
+- Baseline and frontier scripts (`scripts/`).
 
-## Installation
+Key files:
+- `metrics/usage.py`, `metrics/cost.py`
+- `tools/llm.py`, `tools/retrieve.py`, `tools/rerank.py`, `tools/select.py`
+- `cbvrag/runner.py`, `cbvrag/env.py`, `cbvrag/controller_heuristic.py`
+- `rl/collect_traces.py`, `rl/train_il.py`, `rl/train_offline.py`, `rl/eval_policy.py`
+- `scripts/run_cfrag_baseline.py`, `scripts/run_cbvrag_eval.py`, `scripts/plot_frontier.py`
 
-### Prerequisites
+---
 
-- Python 3.8+
-- CUDA-compatible GPU (recommended)
-- At least 24GB GPU memory for optimal performance
+## 2) Requirements
 
-### Quick Start
+- Python 3.9+ recommended
+- CUDA GPU recommended for model inference
+- Local Hugging Face-compatible model directories (or hub-accessible IDs)
 
-1. **Clone the repository**
-```bash
-git clone https://github.com/CF-RAG/CF-RAG.git
-cd CF-RAG
-```
+Install dependencies:
 
-2. **Create and activate a conda environment**
-```bash
-conda create -n cfrag python=3.9
-conda activate cfrag
-```
-
-2. **Install dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-3. **Download models** (Optional - models will be downloaded automatically)
+---
+
+## 3) Configuration
+
+Configuration is centralized in `config.py`.
+
+Important groups:
+
+1. **Model paths/devices**
+   - `LLM_MODEL_ID`, `RERANKER_MODEL_ID`, `EMBEDDING_MODEL_ID`
+   - `LLM_DEVICE`, `RERANKER_DEVICE`, `EMBEDDING_DEVICE`
+
+2. **CF-RAG generation/retrieval settings**
+   - `MAX_NEW_TOKENS`, `EXPLANATORY_TEMPERATURE`, `COUNTERFACTUAL_TEMPERATURE`
+   - `RETRIEVAL_TOP_K`, `RERANKER_TOP_K`
+
+3. **CBV-RAG defaults**
+   - `MAX_CONTEXT_CHUNKS`, `MAX_CONTEXT_TOKENS`
+   - `RETRIEVAL_POOL_K0`, `RERANK_BATCH_SIZE`
+   - `CBVRAG_MAX_STEPS`, `CBVRAG_MAX_BRANCHES`, `CBVRAG_MAX_RETRIEVAL_CALLS`
+
+---
+
+## 4) Running CF-RAG
+
+### Interactive mode
+
 ```bash
-# The system will automatically download required models to model_cache/
-# Ensure you have sufficient disk space (~20GB for all models)
+python main.py
 ```
 
-4. **Prepare knowledge base**
-```bash
-# Create knowledge base directory and add your documents
-mkdir -p knowledge_base
-# Add your .txt, .md, or .json files to the knowledge_base directory
-```
-
-## Usage
-
-### Dataset Evaluation
+### Batch evaluation
 
 ```bash
-# Evaluate on multiple datasets
-python run_evaluation.py --dataset hotpotqa --num-samples 50
-python run_evaluation.py --dataset triviaqa --num-samples 50
-python run_evaluation.py --dataset popqa --num-samples 50
-python musique_evaluation.py --num-samples 50
-python run_evaluation.py --dataset pubhealth --num-samples 50
+python run_evaluation.py --dataset hotpotqa --num_samples 50
+python run_evaluation.py --dataset triviaqa --num_samples 50
+python run_evaluation.py --dataset popqa --num_samples 50
+python run_evaluation.py --dataset musique --num_samples 50
+python run_evaluation.py --dataset pubhealth --num_samples 50
 ```
 
-## Configuration
+Outputs are written as JSONL into `eval_results/` by default.
 
-Key configuration parameters in `config.py`:
+---
 
-### Model Configuration
-```python
-# Model paths (will download automatically if not present)
-LLM_MODEL_ID = "./model_cache/llama3-8b-instruct-local/"
-RERANKER_MODEL_ID = "./model_cache/bge-reranker-large-local/"
-EMBEDDING_MODEL_ID = "./model_cache/bge-large-en-v1.5-local/"
+## 5) Running baseline + CBV-RAG experiments
 
-# Device allocation
-LLM_DEVICE = "cuda:0"  # Adjust based on your GPU setup
-RERANKER_DEVICE = "cuda:0"
-EMBEDDING_DEVICE = "cuda:0"
+### 5.1 CF-RAG baseline with cost logging
+
+```bash
+python scripts/run_cfrag_baseline.py --dataset hotpotqa --num_samples 100
 ```
 
-### Pipeline Parameters
-```python
-# Generation parameters
-EXPLANATORY_TEMPERATURE = 0.1    # Final answer generation
-COUNTERFACTUAL_TEMPERATURE = 0.7 # Counterfactual generation
+This writes per-example logs to:
+- `logs/baseline/<dataset>.jsonl`
 
-# Retrieval parameters
-RETRIEVAL_TOP_K = 15             # Initial retrieval count
-RERANKER_TOP_K = 5               # Final evidence count
-RERANKER_WEIGHT = 0.7            # Relevance vs refutation weight
+### 5.2 CBV-RAG heuristic evaluation
 
-# Multi-draft parameters
-NUM_CLUSTERS = 4                 # Evidence clustering
-NUM_DRAFTS = 4                   # Number of answer drafts
+```bash
+python scripts/run_cbvrag_eval.py \
+  --dataset hotpotqa \
+  --baseline_jsonl logs/baseline/hotpotqa.jsonl \
+  --output logs/cbvrag_eval_hotpotqa.json
 ```
 
-### Advanced Features
-```python
-# Enable simplified mode (single-stage evaluation)
-ENABLE_SIMPLIFIED_MODE = False
+### 5.3 Frontier plotting
 
-# Enable semantic clustering
-USE_SEMANTIC_CLUSTERING = True
-
-# Multi-aspect consistency evaluation
-ENABLE_MULTI_ASPECT_CONSISTENCY = False
+```bash
+python scripts/plot_frontier.py --input logs/cbvrag_eval_hotpotqa.json --out logs/frontier_hotpotqa.png
 ```
 
-## Evaluation Metrics
+---
 
-CF-RAG uses standard QA evaluation metrics:
+## 6) RL workflow
 
-- **Exact Match (EM)**: Binary match between predicted and ground truth answers
-- **F1 Score**: Token-level F1 score between prediction and ground truth
-- **Processing Time**: Average time per question
-- **Smart Matching**: Enhanced matching for various answer formats
+### Step 1: Collect heuristic traces
 
-## Project Structure
-
-```
-CF-RAG/
-├── cfrag_pipeline.py           # Core CF-RAG pipeline implementation
-├── main.py                     # Main entry point and CLI
-├── config.py                   # Configuration parameters
-├── model_loader.py             # Model loading utilities
-├── retriever.py                # Knowledge base retriever
-├── evaluation.py               # Evaluation utilities
-├── data_loader.py              # Dataset loading functions
-├── run_evaluation.py           # Multi-dataset evaluation
-├── musique_evaluation.py       # MusiQue evaluation
-├── requirements.txt            # Python dependencies
-├── knowledge_base/             # Document storage
-├── faiss_index/                # Vector index storage
-├── model_cache/                # Downloaded models
-├── logs/                       # System logs
-└── eval_results/               # Evaluation results
+```bash
+python rl/collect_traces.py --dataset hotpotqa --num_samples 500
 ```
 
-## Hardware Requirements
+Output:
+- `data/traces/hotpotqa.jsonl` (default)
 
-### Minimum Requirements
-- GPU: 8GB VRAM (RTX 3080, RTX 4070, etc.)
-- RAM: 16GB
-- Storage: 50GB free space
+### Step 2: Train behavior cloning policy
 
-### Recommended Requirements (Current Testing Configuration)
-- **GPU: A100 80GB VRAM**  (Currently Tested)
-  - Supports full precision models
-  - Enables parallel draft generation
-  - Optimal for complete 5-stage CF-RAG pipeline
-- **RAM: 32GB+**
-- **Storage: 100GB+ free space** (for models and datasets)
+```bash
+python rl/train_il.py --traces data/traces/hotpotqa.jsonl --out checkpoints/policy_il.pt
+```
 
-### Alternative Configurations
-- **High-End Consumer**: RTX 4090 (24GB) - requires some optimizations
-- **Professional**: RTX A6000 (48GB) - good performance with minor adjustments
-- **Data Center**: H100, A100 80GB - excellent performance
+### Step 3: Evaluate policy imitation quality
 
-## Performance
+```bash
+python rl/eval_policy.py --policy checkpoints/policy_il.pt --traces data/traces/hotpotqa.jsonl
+```
 
-CF-RAG demonstrates strong performance across multiple datasets:
+### Step 4 (optional): Train offline policy
 
-- **HotpotQA**: Improved multi-hop reasoning capabilities
-- **TriviaQA**: Enhanced factual accuracy through counterfactual validation
-- **PopQA**: Better handling of popular entity queries
-- **MusiQue**: Superior performance on complex multi-step reasoning
-- **PubHealth**: Reliable health claim verification
+```bash
+python rl/train_offline.py --traces data/traces/hotpotqa.jsonl --out checkpoints/policy_offline.pt
+```
+
+---
+
+## 7) Token-efficiency design notes (CBV-RAG)
+
+The CBV scaffold enforces/encourages:
+
+- Retrieval pool can be large, but prompt context is selected with caps.
+- Context selection bounded by:
+  - `max_chunks` (default 8)
+  - `max_tokens` (default 1500)
+- Verification is split into:
+  - cheap heuristic verification first
+  - LLM verification only when needed
+- Branching budget to avoid uncontrolled token growth.
+
+---
+
+## 8) Directory overview
+
+```text
+.
+├── cfrag_pipeline.py
+├── retriever.py
+├── main.py
+├── run_evaluation.py
+├── config.py
+├── model_loader.py
+├── data_loader.py
+├── evaluation.py
+├── metrics/
+├── tools/
+├── cbvrag/
+├── rl/
+├── scripts/
+├── logs/
+├── eval_results/
+└── requirements.txt
+```
+
+---
+
+## 9) Practical notes / caveats
+
+- Some scripts load large local models and may require substantial VRAM.
+- Ensure model IDs/paths in `config.py` match your local environment.
+- The CBV-RAG stack is structured for experimentation and iteration; you should expect to tune prompts, budgets, and rewards for your dataset/hardware constraints.
+
+---
+
+## 10) Quick sanity checklist
+
+1. Verify model paths in `config.py`.
+2. Confirm CUDA devices referenced in config are valid.
+3. Run a small CF-RAG eval (`--num_samples 5`).
+4. Run baseline logging script on same subset.
+5. Run CBV heuristic eval and compare token/accuracy metrics.
+
