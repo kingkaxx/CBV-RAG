@@ -108,9 +108,19 @@ def main():
                 except Exception as e:
                     print(f"\n⚠️ Warning: Failed to build temp index for question {i}: {e}")
 
+            token_usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "num_generations": 0,
+                "by_stage": {}
+            }
+
+    
             try:
                 start_time = time.time()
                 prediction = pipeline.run(question)
+                token_usage = pipeline.get_last_token_usage()
                 latency = time.time() - start_time
                 
                 em, f1 = evaluate(prediction, ground_truths, question)
@@ -133,14 +143,18 @@ def main():
                 em, f1 = 0, 0
 
             result = {
-                "id": i,
-                "question": question,
-                "prediction": prediction,
-                "ground_truths": ground_truths,
-                "em": em,
-                "f1": f1,
-                "latency": latency
-            }
+            "question": question,
+            "prediction": prediction,
+            "ground_truths": ground_truths,
+            "em": em,
+            "f1": f1,
+            "latency": latency,
+            "prompt_tokens": token_usage.get("prompt_tokens", 0),
+            "completion_tokens": token_usage.get("completion_tokens", 0),
+            "total_tokens": token_usage.get("total_tokens", 0),
+            "num_generations": token_usage.get("num_generations", 0),
+            "token_usage_by_stage": token_usage.get("by_stage", {})
+}
             all_results.append(result)
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
