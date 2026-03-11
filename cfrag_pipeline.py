@@ -9,7 +9,7 @@ from sklearn.cluster import KMeans
 import config
 from retriever import KnowledgeBaseRetriever
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) 
 logger = logging.getLogger(__name__)
 
 class CFRAGPipeline:
@@ -19,6 +19,7 @@ class CFRAGPipeline:
         self.llm_tokenizer = models["llm_tokenizer"]
         self.reranker = models["reranker_model"]
         self.retriever = retriever
+        self._reset_token_usage()
         
         self.cf_generation_config = {
             "max_new_tokens": 128,
@@ -48,6 +49,55 @@ class CFRAGPipeline:
         }
         
         logger.info("CF-RAG Pipeline initialized successfully")
+    
+    def _reset_token_usage(self):
+        self.last_token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "num_generations": 0,
+            "by_stage": {}
+        }
+
+    def _record_generation_usage(self, inputs, outputs, stage: str):
+        try:
+            prompt_tokens = int(inputs["input_ids"].shape[1])
+            total_sequence_tokens = int(outputs[0].shape[0])
+            completion_tokens = max(0, total_sequence_tokens - prompt_tokens)
+        except Exception:
+            prompt_tokens = 0
+            completion_tokens = 0
+
+        total_tokens = prompt_tokens + completion_tokens
+
+        self.last_token_usage["prompt_tokens"] += prompt_tokens
+        self.last_token_usage["completion_tokens"] += completion_tokens
+        self.last_token_usage["total_tokens"] += total_tokens
+        self.last_token_usage["num_generations"] += 1
+
+        if stage not in self.last_token_usage["by_stage"]:
+            self.last_token_usage["by_stage"][stage] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "num_generations": 0
+            }
+
+        self.last_token_usage["by_stage"][stage]["prompt_tokens"] += prompt_tokens
+        self.last_token_usage["by_stage"][stage]["completion_tokens"] += completion_tokens
+        self.last_token_usage["by_stage"][stage]["total_tokens"] += total_tokens
+        self.last_token_usage["by_stage"][stage]["num_generations"] += 1
+
+    def _generate_with_tracking(self, inputs, stage: str, **generation_kwargs):
+        with torch.no_grad():
+            outputs = self.llm_model.generate(**inputs, **generation_kwargs)
+        self._record_generation_usage(inputs, outputs, stage)
+        return outputs
+
+    def get_last_token_usage(self) -> Dict[str, Any]:
+        if not hasattr(self, "last_token_usage"):
+            self._reset_token_usage()
+        return self.last_token_usage
 
     def _generate_counterfactual_query(self, original_query: str) -> List[str]:
         logger.info(f"Generating counterfactual queries for: {original_query}")
@@ -76,9 +126,10 @@ class CFRAGPipeline:
             max_length=config.MAX_INPUT_LENGTH
         ).to(self.llm_model.device)
         
-        with torch.no_grad():
-            outputs = self.llm_model.generate(
-                **inputs,
+        
+        outputs = self._generate_with_tracking(
+                inputs,
+                stage = "counterfactual_queries",
                 **self.cf_generation_config
             )
         
@@ -400,8 +451,9 @@ class CFRAGPipeline:
                 ).to(self.llm_model.device)
                 
                 with torch.no_grad():
-                    outputs = self.llm_model.generate(
-                        **inputs,
+                    outputs = self._generate_with_tracking(
+                        inputs,
+                        stage = "draft_generation",
                         **self.draft_generation_config
                     )
                 
@@ -644,7 +696,7 @@ Rate the completeness of the answer (Strong/Moderate/Weak/None):"""
                     do_sample=False,
                     pad_token_id=self.llm_tokenizer.eos_token_id,
                 )
-                outputs = self.llm_model.generate(**inputs, generation_config=eval_config)
+                outputs = self._generate_with_tracking(inputs, stage = "verification_reasoning",generation_config=eval_config)
             
             result = self.llm_tokenizer.decode(
                 outputs[0][len(inputs["input_ids"][0]):], skip_special_tokens=True
@@ -765,9 +817,10 @@ Support level:"""
             max_length=config.MAX_INPUT_LENGTH
         ).to(self.llm_model.device)
         
-        with torch.no_grad():
-            outputs = self.llm_model.generate(
-                **inputs,
+    
+        outputs = self._generate_with_tracking(
+                inputs,
+                stage = "explanatory_answer",
                 **self.exp_generation_config
             )
         
@@ -826,9 +879,10 @@ Please provide a comprehensive response that improves upon this draft with detai
                 max_length=config.MAX_INPUT_LENGTH
             ).to(self.llm_model.device)
             
-            with torch.no_grad():
-                outputs = self.llm_model.generate(
-                    **inputs,
+          
+            outputs = self._generate_with_tracking(
+                    inputs,
+                    stage="final_answer",
                     **self.exp_generation_config
                 )
             
@@ -851,7 +905,7 @@ Please provide a comprehensive response that improves upon this draft with detai
 
     def run(self, query: str) -> str:
         logger.info(f"Starting CF-RAG pipeline for query: {query}")
-        
+        self._reset_token_usage()
         try:
             logger.info("Stage 1: Generating counterfactual queries")
             cf_queries = self._generate_counterfactual_query(query)
