@@ -10,7 +10,7 @@ import model_loader
 from retriever import KnowledgeBaseRetriever
 from cfrag_pipeline import CFRAGPipeline
 from evaluation import evaluate
-from improved_data_loader import load_and_process_data
+from data_loader import load_and_process_data
 
 def ensure_datasets_dependency():
     try:
