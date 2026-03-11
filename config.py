@@ -1,13 +1,14 @@
 import os
 from pathlib import Path
 
-LLM_MODEL_ID = "./model_cache/llama3-8b-instruct-local/"
-RERANKER_MODEL_ID = "./model_cache/bge-reranker-large-local/"
-EMBEDDING_MODEL_ID = "./model_cache/bge-large-en-v1.5-local/"
+LLM_MODEL_ID = "/scratch/yl258/kp759/hf/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
+RERANKER_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-reranker-large-local"
+EMBEDDING_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-large-en-v1.5-local"
 
-LLM_DEVICE = "cuda:1"
-RERANKER_DEVICE = "cuda:1"
-EMBEDDING_DEVICE = "cuda:1"
+
+LLM_DEVICE = "cuda:0"
+RERANKER_DEVICE = "cuda:0"
+EMBEDDING_DEVICE = "cuda:0"
 
 MAX_NEW_TOKENS = 512
 MAX_INPUT_LENGTH = 4096
@@ -251,11 +252,3 @@ if __name__ != "__main__":
         init_config()
     except Exception as e:
         print(f"Warning: Config initialization failed: {e}")
-# CBV-RAG defaults
-MAX_CONTEXT_CHUNKS = 8
-MAX_CONTEXT_TOKENS = 1500
-RETRIEVAL_POOL_K0 = 50
-RERANK_BATCH_SIZE = 32
-CBVRAG_MAX_STEPS = 8
-CBVRAG_MAX_BRANCHES = 3
-CBVRAG_MAX_RETRIEVAL_CALLS = 5
