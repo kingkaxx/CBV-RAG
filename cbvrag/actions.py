@@ -1,0 +1,15 @@
+from enum import IntEnum
+
+
+class Action(IntEnum):
+    ANSWER_DIRECT = 0
+    RETRIEVE_MORE_SMALL = 1
+    RETRIEVE_MORE_LARGE = 2
+    SPAWN_COUNTERFACTUAL = 3
+    SELECT_CONTEXT = 4
+    VERIFY_CHEAP = 5
+    VERIFY_LLM = 6
+    PRUNE_BRANCH = 7
+    MERGE_BRANCHES = 8
+    SUMMARIZE_STATE = 9
+    STOP_AND_ANSWER = 10
