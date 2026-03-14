@@ -5,7 +5,7 @@ import json
 
 import torch
 
-from rl.train_il import PolicyMLP
+from rl.policy import build_policy, policy_config_from_checkpoint
 
 
 def main() -> int:
@@ -15,7 +15,8 @@ def main() -> int:
     args = ap.parse_args()
 
     ckpt = torch.load(args.policy, map_location="cpu")
-    model = PolicyMLP(obs_dim=ckpt["obs_dim"])
+    cfg = policy_config_from_checkpoint(ckpt)
+    model = build_policy(cfg)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -29,7 +30,18 @@ def main() -> int:
             correct += int(pred == int(row["action"]))
             total += 1
 
-    print(json.dumps({"action_match": correct / max(1, total), "n": total}, indent=2))
+    print(
+        json.dumps(
+            {
+                "action_match": correct / max(1, total),
+                "n": total,
+                "policy_type": cfg.policy_type,
+                "obs_dim": cfg.obs_dim,
+                "act_dim": cfg.act_dim,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
