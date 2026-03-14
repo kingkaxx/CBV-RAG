@@ -6,6 +6,7 @@ from pathlib import Path
 from statistics import mean
 
 import torch
+from sentence_transformers import SentenceTransformer
 
 import config
 import model_loader
@@ -14,7 +15,7 @@ from cbvrag.controller_learned import LearnedController
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
 from evaluation import smart_exact_match_score
-from retriever import KnowledgeBaseRetriever
+from retrieval.global_index import GlobalChunkRetriever
 from tools.llm import LLMEngine
 from tools.rerank import CrossEncoderReranker
 from tools.retrieve import RetrieverTool
@@ -86,6 +87,10 @@ def main() -> int:
     ap.add_argument("--policy_mode", choices=["greedy", "sample"], default="greedy")
     ap.add_argument("--llm_device", default=None)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--kb_jsonl", default="data/kb/hotpotqa_train_kb.jsonl")
+    ap.add_argument("--index_dir", default="data/index/hotpotqa_train")
+    ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--dataset_filter", default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -95,10 +100,17 @@ def main() -> int:
     data = load_and_process_data(args.dataset, args.cache_dir)
 
     models = model_loader.load_all_models()
-    kb = KnowledgeBaseRetriever(models["embedding_model"])
+    global_retriever_model = SentenceTransformer(args.embedding_model)
+    kb = GlobalChunkRetriever(global_retriever_model)
+    kb.load(args.index_dir)
+    effective_filter = args.dataset_filter or args.dataset
+    print(
+        f"[run_cbvrag_eval] global_index_dir={args.index_dir} kb_rows={len(kb.rows)} dataset_filter={effective_filter}",
+        flush=True,
+    )
     tools = {
         "llm": LLMEngine(getattr(models["llm_model"], "name_or_path", models["llm_model"].config._name_or_path), device=llm_device),
-        "retrieve": RetrieverTool(kb),
+        "retrieve": RetrieverTool(kb, dataset_filter=effective_filter),
         "rerank": CrossEncoderReranker(),
     }
 
