@@ -37,7 +37,8 @@ def load_hotpotqa_data(cache_dir, num_samples=None, random_seed=42):
         processed_data.append({
             "question": example['question'],
             "answer": [example['answer']],
-            "context": context_docs
+            "context": context_docs,
+            "support_titles": list((example.get("supporting_facts") or {}).get("title", []))
         })
     return processed_data
 
@@ -255,7 +256,8 @@ def _load_musique_from_jsonl(file_path, num_samples=None, random_seed=42):
         processed_data.append({
             "question": example.get('question', 'Unknown question'),
             "answer": unique_answers,
-            "context": context_docs
+            "context": context_docs,
+            "support_titles": [p.get("title", "") for p in (example.get("paragraphs") or []) if p.get("is_supporting", False)]
         })
     
     logger.info(f"Successfully processed {len(processed_data)} MusiQue examples.")

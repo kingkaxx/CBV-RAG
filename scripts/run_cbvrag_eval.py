@@ -62,6 +62,7 @@ def evaluate_records(records):
         "avg_branches": sum(r["branches"] for r in records) / n,
         "success_rate": sum(r["success"] for r in records) / n,
         "early_stop_rate": sum(r["early_exit"] for r in records) / n,
+        "support_doc_recall": sum(r.get("support_hit", 0.0) for r in records) / n,
     }
 
 
@@ -115,6 +116,15 @@ def main() -> int:
         correct = any(smart_exact_match_score(pred, g, ex["question"]) for g in ex["answer"])
         best_f1 = max([compute_f1(pred, g) for g in ex.get("answer", [""])], default=0.0)
         success = bool(correct)
+        support_titles = set(ex.get("support_titles") or [])
+        retrieved_titles = {
+            (ev.get("title") or "").strip()
+            for ev in log["state"].get("evidence_pool", {}).values()
+            if isinstance(ev, dict)
+        }
+        support_hit = 0.0
+        if support_titles:
+            support_hit = 1.0 if (retrieved_titles & support_titles) else 0.0
         cbv_records.append(
             {
                 "qid": str(i),
@@ -129,6 +139,7 @@ def main() -> int:
                 "steps": steps,
                 "branches": branches,
                 "early_exit": steps < log["state"]["budgets"].get("max_steps", steps),
+                "support_hit": support_hit,
             }
         )
 
