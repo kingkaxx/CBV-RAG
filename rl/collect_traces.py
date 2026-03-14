@@ -99,6 +99,23 @@ def main() -> int:
     with output.open("w", encoding="utf-8") as f:
         for i, ex in enumerate(data):
             qid = str(ex.get("id", i))
+
+            # For datasets like HotpotQA that include per-example context, build a temporary
+            # in-memory retrieval index so trace collection does not depend on knowledge_base/.
+            context_docs = ex.get("context") if isinstance(ex, dict) else None
+            if context_docs:
+                retriever.build_temp_index_from_docs(context_docs)
+                # Avoid cross-example cache collisions: use per-qid retrieval cache dir.
+                tools["retrieve"] = RetrieverTool(retriever, cache_dir=f"./cache/retrieval/{args.dataset}/{qid}")
+                print(
+                    f"[collect_traces] built temporary retrieval index for qid={qid} "
+                    f"with {len(context_docs)} context docs",
+                    flush=True,
+                )
+            else:
+                retriever.clear_temp_index()
+                tools["retrieve"] = RetrieverTool(retriever)
+
             controller = HeuristicController()
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
             golds = ex.get("answer") or [""]
