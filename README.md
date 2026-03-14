@@ -125,31 +125,59 @@ python scripts/plot_frontier.py --input logs/cbvrag_eval_hotpotqa.json --out log
 
 ## 6) RL workflow
 
-### Step 1: Collect heuristic traces
+### Step 1: Collect heuristic traces (GPU or CPU)
 
 ```bash
-python rl/collect_traces.py --dataset hotpotqa --num_samples 500
+python rl/collect_traces.py   --dataset hotpotqa   --num_samples 500   --llm_device cuda:0   --output data/traces/hotpotqa_raw.jsonl
 ```
 
-Output:
-- `data/traces/hotpotqa.jsonl` (default)
+Useful filtering controls are available directly in collection (`--keep_only_successful`, `--min_episode_reward`, `--max_episode_tokens`, `--max_episode_steps`).
 
-### Step 2: Train behavior cloning policy
+### Step 2: Prepare train/val traces without qid leakage
 
 ```bash
-python rl/train_il.py --traces data/traces/hotpotqa.jsonl --out checkpoints/policy_il.pt
+python rl/prepare_traces.py   --input data/traces/hotpotqa_raw.jsonl   --output_dir data/traces/hotpotqa_prepared   --val_ratio 0.2   --seed 42   --only_successful
 ```
 
-### Step 3: Evaluate policy imitation quality
+Outputs:
+- `train.jsonl`
+- `val.jsonl`
+- `summary.json`
+
+### Step 3: Train IL policy (architecture configurable)
 
 ```bash
-python rl/eval_policy.py --policy checkpoints/policy_il.pt --traces data/traces/hotpotqa.jsonl
+python rl/train_il.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --out checkpoints/policy_il.pt   --policy_type mlp   --hidden_dim 128   --num_layers 2   --dropout 0.0   --history_len 1   --seed 42
 ```
 
-### Step 4 (optional): Train offline policy
+### Step 4: Train offline RL policy (modular objectives)
 
 ```bash
-python rl/train_offline.py --traces data/traces/hotpotqa.jsonl --out checkpoints/policy_offline.pt
+python rl/train_offline.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --out checkpoints/policy_offline.pt   --objective awr   --bc_coef 0.1   --adv_temperature 1.0   --entropy_coef 0.0   --success_bonus 0.0   --seed 42
+```
+
+### Step 5: Evaluate heuristic vs learned controllers end-to-end
+
+```bash
+python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type heuristic --llm_device cuda:0 --output logs/eval_heuristic.json
+python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type il --policy_ckpt checkpoints/policy_il.pt --policy_mode greedy --llm_device cuda:0 --output logs/eval_il.json
+python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type offline --policy_ckpt checkpoints/policy_offline.pt --policy_mode greedy --llm_device cuda:0 --output logs/eval_offline.json
+```
+
+Each eval run also writes per-example records (JSONL) with EM/F1, token use, retrieval calls, steps, branches, and success/early-stop indicators.
+
+### Step 6: Side-by-side controller comparison
+
+```bash
+python scripts/compare_controllers.py   --inputs heuristic=logs/eval_heuristic.records.jsonl il=logs/eval_il.records.jsonl offline=logs/eval_offline.records.jsonl   --output logs/controller_comparison.json
+```
+
+### Step 7: Helper experiment scripts
+
+```bash
+scripts/run_trace_scale_ablation.sh hotpotqa
+scripts/run_reward_ablation.sh data/traces/hotpotqa_prepared/train.jsonl data/traces/hotpotqa_prepared/val.jsonl
+scripts/run_controller_compare.sh hotpotqa checkpoints/policy_il.pt checkpoints/policy_offline.pt
 ```
 
 ---
