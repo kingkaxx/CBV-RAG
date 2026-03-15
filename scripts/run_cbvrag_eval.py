@@ -108,6 +108,7 @@ def main() -> int:
     ap.add_argument("--index_dir", default="data/index/hotpotqa_train")
     ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--dataset_filter", default=None)
+    ap.add_argument("--num_samples", type=int, default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
