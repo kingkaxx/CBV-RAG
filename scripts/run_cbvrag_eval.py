@@ -115,7 +115,9 @@ def main() -> int:
     print(f"[run_cbvrag_eval] LLM device: {llm_device}", flush=True)
 
     data = load_and_process_data(args.dataset, args.cache_dir)
-
+    if args.num_samples is not None:
+        data = data[: args.num_samples]
+    
     models = model_loader.load_all_models()
     global_retriever_model = SentenceTransformer(args.embedding_model)
     kb = GlobalChunkRetriever(global_retriever_model)
