@@ -154,9 +154,11 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
 
         # Early-stop safeguard: when controller tries to stop while still uncertain,
         # run one cheap verification first if there is remaining budget.
+        early_step_cutoff = max(2, budgets["max_steps"] // 2)
         if (
             action == Action.STOP_AND_ANSWER
             and state.verification_status == "unknown"
+            and state.step <= early_step_cutoff
             and state.step < budgets["max_steps"] - 1
         ):
             action = Action.VERIFY_CHEAP

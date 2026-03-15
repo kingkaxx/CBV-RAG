@@ -42,15 +42,15 @@ class HeuristicController:
     def _verification_calls(state) -> int:
         return int((state.metrics or {}).get("verify_calls", 0))
 
-    def _is_extremely_strong_evidence(self, state) -> bool:
+    def _is_strong_early_stop(self, state) -> bool:
         return (
             self._selected_count(state) >= 3
             and self._selected_unique_titles(state) >= 2
             and self._rerank_gap(state) > 0.35
         )
 
-    def _is_weak_selected_evidence(self, state) -> bool:
-        return self._selected_count(state) < 2 or self._rerank_gap(state) < 0.18
+    def _has_verification_signal(self, state) -> bool:
+        return self._verification_calls(state) > 0 or state.verification_status in {"supported", "contradicted"}
 
     def act(self, obs, state) -> int:
         step = state.step
@@ -59,7 +59,6 @@ class HeuristicController:
         rerank_gap = self._rerank_gap(state)
         retrieval_calls = self._retrieval_calls(state)
         branch_count = len(state.branches)
-        max_retrieval_calls = int(state.budgets.get("max_retrieval_calls", 5))
         max_branches = int(state.budgets.get("max_branches", 3))
         verification_status = state.verification_status
 
@@ -68,37 +67,40 @@ class HeuristicController:
         elif step == 1:
             action = Action.SELECT_CONTEXT
         elif step == 2:
-            if self._is_weak_selected_evidence(state) or unique_title_count < 2:
+            if selected_count < 2 or unique_title_count < 2:
                 action = Action.RETRIEVE_MORE_LARGE
             else:
-                action = Action.SPAWN_COUNTERFACTUAL
+                action = Action.VERIFY_CHEAP
         elif step == 3:
-            action = Action.SELECT_CONTEXT
-        elif step == 4:
-            action = Action.VERIFY_CHEAP
-        elif step == 5:
-            if verification_status == "unknown":
-                if retrieval_calls < max_retrieval_calls and unique_title_count < 3:
-                    action = Action.RETRIEVE_MORE_SMALL
-                else:
-                    action = Action.VERIFY_LLM
-            elif verification_status == "contradicted":
-                if branch_count < max_branches:
+            if (
+                verification_status == "supported"
+                and selected_count >= 2
+                and unique_title_count >= 2
+                and rerank_gap > 0.22
+            ):
+                action = Action.STOP_AND_ANSWER
+            elif retrieval_calls < 2:
+                action = Action.RETRIEVE_MORE_SMALL
+            else:
+                # Branching is fallback: only after verification signal or clearly uncertain evidence.
+                if self._has_verification_signal(state) or rerank_gap < 0.12:
                     action = Action.SPAWN_COUNTERFACTUAL
                 else:
-                    action = Action.RETRIEVE_MORE_SMALL
-            else:
-                action = Action.STOP_AND_ANSWER
-        elif step == 6:
-            if verification_status == "supported" and selected_count >= 2:
-                action = Action.STOP_AND_ANSWER
-            else:
+                    action = Action.VERIFY_CHEAP
+        elif step == 4:
+            action = Action.SELECT_CONTEXT
+        elif step == 5:
+            if verification_status == "unknown":
                 action = Action.VERIFY_LLM
+            elif verification_status == "contradicted" and branch_count < max_branches:
+                action = Action.SPAWN_COUNTERFACTUAL
+            else:
+                action = Action.STOP_AND_ANSWER
         else:
             action = Action.STOP_AND_ANSWER
 
-        # Do not allow early stop before verification unless evidence is extremely strong.
-        if action == Action.STOP_AND_ANSWER and self._verification_calls(state) == 0 and not self._is_extremely_strong_evidence(state):
+        # Do not allow early STOP before verification unless evidence is very strong.
+        if action == Action.STOP_AND_ANSWER and self._verification_calls(state) == 0 and not self._is_strong_early_stop(state):
             action = Action.VERIFY_CHEAP
 
         self.trace.append(
@@ -112,7 +114,9 @@ class HeuristicController:
                     "rerank_gap": rerank_gap,
                     "selected_evidence_count": selected_count,
                     "unique_title_count": unique_title_count,
+                    "retrieval_calls": retrieval_calls,
                     "verification_status": verification_status,
+                    "branch_count": branch_count,
                 },
             }
         )

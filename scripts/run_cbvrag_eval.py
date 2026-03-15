@@ -92,10 +92,15 @@ def controller_from_args(args):
     return LearnedController(policy_ckpt=args.policy_ckpt, mode=args.policy_mode)
 
 
+def _debug_small_run(args) -> bool:
+    return args.num_samples is not None and args.num_samples <= 30
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--cache_dir", default="./huggingface_cache")
+    ap.add_argument("--num_samples", type=int, default=None)
     ap.add_argument("--baseline_jsonl", default=None)
     ap.add_argument("--output", default="logs/cbvrag_eval.json")
     ap.add_argument("--records_output", default=None)
@@ -108,17 +113,14 @@ def main() -> int:
     ap.add_argument("--index_dir", default="data/index/hotpotqa_train")
     ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--dataset_filter", default=None)
-    ap.add_argument("--num_samples", type=int, default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     llm_device = resolve_llm_device(args.llm_device)
     print(f"[run_cbvrag_eval] LLM device: {llm_device}", flush=True)
 
-    data = load_and_process_data(args.dataset, args.cache_dir)
-    if args.num_samples is not None:
-        data = data[: args.num_samples]
-    
+    data = load_and_process_data(args.dataset, args.cache_dir, num_samples=args.num_samples, random_seed=args.seed)
+
     models = model_loader.load_all_models()
     global_retriever_model = SentenceTransformer(args.embedding_model)
     kb = GlobalChunkRetriever(global_retriever_model)
@@ -142,24 +144,23 @@ def main() -> int:
         running = int(tools["llm"].usage_tracker.summary()["total_tokens"])
         total_tokens = max(0, running - prev_total_tokens)
         prev_total_tokens = running
-        retrieval_calls = int(log["state"]["metrics"]["retrieval_calls"])
+        retrieval_calls = int(log["state"]["metrics"].get("retrieval_calls", 0))
         steps = len(log.get("steps", []))
         branches = len(log["state"].get("branches", {}))
-        correct = any(compute_em(pred, g) for g in ex["answer"])
-        best_f1 = max([compute_f1(pred, g) for g in ex.get("answer", [""])], default=0.0)
+
+        gold_answers = list(ex.get("answer", []))
+        correct = any(compute_em(pred, g) for g in gold_answers)
+        best_f1 = max([compute_f1(pred, g) for g in gold_answers], default=0.0)
         success = bool(correct)
-        support_titles = set(ex.get("support_titles") or [])
+
+        evidence_pool = log["state"].get("evidence_pool", {})
+        selected_evidence_ids = log["state"].get("selected_evidence_ids", [])
+
         retrieved_titles = {
             (ev.get("title") or "").strip()
-            for ev in log["state"].get("evidence_pool", {}).values()
+            for ev in evidence_pool.values()
             if isinstance(ev, dict)
         }
-        support_hit = 0.0
-        if support_titles:
-            support_hit = 1.0 if (retrieved_titles & support_titles) else 0.0
-
-        selected_evidence_ids = log["state"].get("selected_evidence_ids", [])
-        evidence_pool = log["state"].get("evidence_pool", {})
         selected_evidence_titles = []
         for eid in selected_evidence_ids:
             ev = evidence_pool.get(eid, {}) if isinstance(evidence_pool, dict) else {}
@@ -167,39 +168,63 @@ def main() -> int:
             if title:
                 selected_evidence_titles.append(title)
 
-        gold_answers = list(ex.get("answer", []))
+        support_titles = set(ex.get("support_titles") or [])
+        support_hit = 1.0 if (support_titles and (retrieved_titles & support_titles)) else 0.0
+
+        rerank_scores = sorted(
+            [float(ev.get("rerank_score", 0.0)) for ev in evidence_pool.values() if isinstance(ev, dict)],
+            reverse=True,
+        )
+
         if correct and best_f1 == 0.0:
             print(
                 f"[run_cbvrag_eval][warn] correct=True but f1=0.0 qid={i} pred={pred!r} gold={gold_answers!r}",
                 flush=True,
             )
 
-        cbv_records.append(
-            {
-                "qid": str(i),
-                "controller_type": args.controller_type,
-                "policy_ckpt": args.policy_ckpt,
-                "policy_mode": args.policy_mode,
-                "correct": bool(correct),
-                "f1": float(best_f1),
-                "success": success,
-                "total_tokens": total_tokens,
-                "retrieval_calls": retrieval_calls,
-                "steps": steps,
-                "branches": branches,
-                "early_exit": steps < log["state"]["budgets"].get("max_steps", steps),
-                "support_hit": support_hit,
-                "question": ex.get("question", ""),
-                "prediction": pred,
-                "gold_answers": gold_answers,
-                "support_titles": list(ex.get("support_titles") or []),
-                "retrieved_titles": sorted(t for t in retrieved_titles if t),
-                "selected_evidence_titles": selected_evidence_titles,
-                "actions_taken": [s.get("action") for s in log.get("steps", []) if isinstance(s, dict)],
-                "verification_status": log["state"].get("verification_status", "unknown"),
-                "final_branch_count": len(log["state"].get("branches", {})),
-            }
-        )
+        record = {
+            "qid": str(i),
+            "controller_type": args.controller_type,
+            "policy_ckpt": args.policy_ckpt,
+            "policy_mode": args.policy_mode,
+            "correct": bool(correct),
+            "f1": float(best_f1),
+            "success": success,
+            "total_tokens": total_tokens,
+            "retrieval_calls": retrieval_calls,
+            "steps": steps,
+            "branches": branches,
+            "early_exit": steps < log["state"]["budgets"].get("max_steps", steps),
+            "support_hit": support_hit,
+            "question": ex.get("question", ""),
+            "prediction": pred,
+            "gold_answers": gold_answers,
+            "support_titles": list(ex.get("support_titles") or []),
+            "retrieved_titles": sorted(t for t in retrieved_titles if t),
+            "selected_evidence_titles": selected_evidence_titles,
+            "actions_taken": [s.get("action") for s in log.get("steps", []) if isinstance(s, dict)],
+            "verification_status": log["state"].get("verification_status", "unknown"),
+            "final_branch_count": len(log["state"].get("branches", {})),
+            "selected_evidence_count": len(selected_evidence_ids),
+            "unique_selected_title_count": len(set(selected_evidence_titles)),
+            "top_rerank_scores": rerank_scores[:5],
+        }
+        cbv_records.append(record)
+
+        if _debug_small_run(args):
+            trace = getattr(controller, "trace", [])
+            print(f"[pilot] qid={record['qid']} correct={record['correct']} f1={record['f1']:.3f}", flush=True)
+            for t_idx, step_rec in enumerate(trace):
+                info = step_rec.get("info", {}) if isinstance(step_rec, dict) else {}
+                print(
+                    "[pilot] "
+                    f"qid={record['qid']} step={info.get('step', t_idx)} action={step_rec.get('action')} "
+                    f"selected={info.get('selected_evidence_count', 'na')} unique_titles={info.get('unique_title_count', 'na')} "
+                    f"retrieval_calls={info.get('retrieval_calls', retrieval_calls)} "
+                    f"verification={info.get('verification_status', record['verification_status'])} "
+                    f"rerank_gap={info.get('rerank_gap', 'na')}",
+                    flush=True,
+                )
 
     key = f"cbvrag_{args.controller_type}"
     out = {
