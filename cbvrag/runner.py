@@ -151,6 +151,16 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         obs = build_features(state)
         action_idx = controller.act(obs, state)
         action = Action(action_idx)
+
+        # Early-stop safeguard: when controller tries to stop while still uncertain,
+        # run one cheap verification first if there is remaining budget.
+        if (
+            action == Action.STOP_AND_ANSWER
+            and state.verification_status == "unknown"
+            and state.step < budgets["max_steps"] - 1
+        ):
+            action = Action.VERIFY_CHEAP
+
         costs = execute_action(state, action, controller, tools)
         logs.append({"step": state.step, "action": int(action), "costs": costs, "metrics": dict(state.metrics)})
 

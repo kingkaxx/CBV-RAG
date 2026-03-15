@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import string
 from pathlib import Path
 from statistics import mean
 
@@ -14,7 +16,6 @@ from cbvrag.controller_heuristic import HeuristicController
 from cbvrag.controller_learned import LearnedController
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
-from evaluation import smart_exact_match_score
 from retrieval.global_index import GlobalChunkRetriever
 from tools.llm import LLMEngine
 from tools.rerank import CrossEncoderReranker
@@ -31,25 +32,41 @@ def resolve_llm_device(requested: str | None) -> str:
     return device
 
 
+def normalize_answer(text: str) -> str:
+    text = (text or "").lower()
+    text = "".join(ch for ch in text if ch not in set(string.punctuation))
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    return " ".join(text.split())
+
+
 def compute_f1(pred: str, gold: str) -> float:
-    ps, gs = pred.lower().split(), gold.lower().split()
-    if not ps and not gs:
+    pred_tokens = normalize_answer(pred).split()
+    gold_tokens = normalize_answer(gold).split()
+    if not pred_tokens and not gold_tokens:
         return 1.0
-    if not ps or not gs:
+    if not pred_tokens or not gold_tokens:
         return 0.0
+
     common = 0
-    g_counts = {}
-    for t in gs:
-        g_counts[t] = g_counts.get(t, 0) + 1
-    for t in ps:
-        if g_counts.get(t, 0) > 0:
+    gold_counts = {}
+    for t in gold_tokens:
+        gold_counts[t] = gold_counts.get(t, 0) + 1
+    for t in pred_tokens:
+        if gold_counts.get(t, 0) > 0:
             common += 1
-            g_counts[t] -= 1
+            gold_counts[t] -= 1
+
     if common == 0:
         return 0.0
-    p = common / len(ps)
-    r = common / len(gs)
-    return 2 * p * r / (p + r)
+    precision = common / len(pred_tokens)
+    recall = common / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_em(pred: str, gold: str) -> bool:
+    npred = normalize_answer(pred)
+    ngold = normalize_answer(gold)
+    return bool(ngold) and ngold in npred
 
 
 def evaluate_records(records):
@@ -91,7 +108,6 @@ def main() -> int:
     ap.add_argument("--index_dir", default="data/index/hotpotqa_train")
     ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--dataset_filter", default=None)
-    ap.add_argument("--num_samples", type=int, default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -128,7 +144,7 @@ def main() -> int:
         retrieval_calls = int(log["state"]["metrics"]["retrieval_calls"])
         steps = len(log.get("steps", []))
         branches = len(log["state"].get("branches", {}))
-        correct = any(smart_exact_match_score(pred, g, ex["question"]) for g in ex["answer"])
+        correct = any(compute_em(pred, g) for g in ex["answer"])
         best_f1 = max([compute_f1(pred, g) for g in ex.get("answer", [""])], default=0.0)
         success = bool(correct)
         support_titles = set(ex.get("support_titles") or [])
@@ -140,6 +156,23 @@ def main() -> int:
         support_hit = 0.0
         if support_titles:
             support_hit = 1.0 if (retrieved_titles & support_titles) else 0.0
+
+        selected_evidence_ids = log["state"].get("selected_evidence_ids", [])
+        evidence_pool = log["state"].get("evidence_pool", {})
+        selected_evidence_titles = []
+        for eid in selected_evidence_ids:
+            ev = evidence_pool.get(eid, {}) if isinstance(evidence_pool, dict) else {}
+            title = (ev.get("title") or "").strip() if isinstance(ev, dict) else ""
+            if title:
+                selected_evidence_titles.append(title)
+
+        gold_answers = list(ex.get("answer", []))
+        if correct and best_f1 == 0.0:
+            print(
+                f"[run_cbvrag_eval][warn] correct=True but f1=0.0 qid={i} pred={pred!r} gold={gold_answers!r}",
+                flush=True,
+            )
+
         cbv_records.append(
             {
                 "qid": str(i),
@@ -155,6 +188,15 @@ def main() -> int:
                 "branches": branches,
                 "early_exit": steps < log["state"]["budgets"].get("max_steps", steps),
                 "support_hit": support_hit,
+                "question": ex.get("question", ""),
+                "prediction": pred,
+                "gold_answers": gold_answers,
+                "support_titles": list(ex.get("support_titles") or []),
+                "retrieved_titles": sorted(t for t in retrieved_titles if t),
+                "selected_evidence_titles": selected_evidence_titles,
+                "actions_taken": [s.get("action") for s in log.get("steps", []) if isinstance(s, dict)],
+                "verification_status": log["state"].get("verification_status", "unknown"),
+                "final_branch_count": len(log["state"].get("branches", {})),
             }
         )
 
