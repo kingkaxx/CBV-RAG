@@ -55,6 +55,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
                 rerank_score=float(c.get("rerank_score", 0.0)),
                 short_claim=c.get("text", "")[:180],
                 branch_id=state.active_branch_id,
+                title=str(c.get("title") or c.get("meta", {}).get("title", "")),
             )
 
     elif action == Action.SELECT_CONTEXT:
@@ -66,6 +67,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
                 "retriever_score": e.retriever_score,
                 "rerank_score": e.rerank_score,
                 "evidence_id": e.evidence_id,
+                "title": e.title,
             }
             for e in state.evidence_pool.values()
         ]
@@ -149,6 +151,18 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         obs = build_features(state)
         action_idx = controller.act(obs, state)
         action = Action(action_idx)
+
+        # Early-stop safeguard: when controller tries to stop while still uncertain,
+        # run one cheap verification first if there is remaining budget.
+        early_step_cutoff = max(2, budgets["max_steps"] // 2)
+        if (
+            action == Action.STOP_AND_ANSWER
+            and state.verification_status == "unknown"
+            and state.step <= early_step_cutoff
+            and state.step < budgets["max_steps"] - 1
+        ):
+            action = Action.VERIFY_CHEAP
+
         costs = execute_action(state, action, controller, tools)
         logs.append({"step": state.step, "action": int(action), "costs": costs, "metrics": dict(state.metrics)})
 

@@ -123,6 +123,20 @@ python scripts/plot_frontier.py --input logs/cbvrag_eval_hotpotqa.json --out log
 
 ---
 
+
+### Multi-dataset KB + global index
+
+```bash
+python data/build_multidataset_kb.py \
+  --datasets hotpotqa triviaqa popqa pubhealth musique \
+  --split validation \
+  --qa_out data/multidataset_qa.jsonl \
+  --kb_out data/global_kb_chunks.jsonl
+
+python retrieval/global_index.py --mode build --kb_jsonl data/global_kb_chunks.jsonl --index_dir data/global_index
+python retrieval/global_index.py --mode diagnose --qa_jsonl data/multidataset_qa.jsonl --index_dir data/global_index --top_k 20
+```
+
 ## 6) RL workflow
 
 ### Step 1: Collect heuristic traces (GPU or CPU)
@@ -153,7 +167,7 @@ python rl/train_il.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --o
 ### Step 4: Train offline RL policy (modular objectives)
 
 ```bash
-python rl/train_offline.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --out checkpoints/policy_offline.pt   --objective awr   --bc_coef 0.1   --adv_temperature 1.0   --entropy_coef 0.0   --success_bonus 0.0   --seed 42
+python rl/train_offline.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --init_policy checkpoints/policy_il.pt   --out checkpoints/policy_offline.pt   --objective awr   --bc_coef 0.1   --adv_temperature 1.0   --entropy_coef 0.0   --success_bonus 0.0   --seed 42
 ```
 
 ### Step 5: Evaluate heuristic vs learned controllers end-to-end
@@ -237,3 +251,12 @@ The CBV scaffold enforces/encourages:
 4. Run baseline logging script on same subset.
 5. Run CBV heuristic eval and compare token/accuracy metrics.
 
+
+
+### Multi-dataset rollout benchmark runner
+
+```bash
+python scripts/run_multidataset_benchmark.py --controller_type heuristic
+python scripts/run_multidataset_benchmark.py --controller_type il --policy_ckpt checkpoints/policy_il.pt
+python scripts/run_multidataset_benchmark.py --controller_type offline --policy_ckpt checkpoints/policy_offline.pt
+```
