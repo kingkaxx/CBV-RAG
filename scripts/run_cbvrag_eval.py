@@ -91,6 +91,7 @@ def main() -> int:
     ap.add_argument("--index_dir", default="data/index/hotpotqa_train")
     ap.add_argument("--embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--dataset_filter", default=None)
+    ap.add_argument("--num_samples", type=int, default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -98,7 +99,9 @@ def main() -> int:
     print(f"[run_cbvrag_eval] LLM device: {llm_device}", flush=True)
 
     data = load_and_process_data(args.dataset, args.cache_dir)
-
+    if args.num_samples is not None:
+        data = data[: args.num_samples]
+    
     models = model_loader.load_all_models()
     global_retriever_model = SentenceTransformer(args.embedding_model)
     kb = GlobalChunkRetriever(global_retriever_model)
