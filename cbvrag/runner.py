@@ -146,11 +146,21 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     budgets = {**default_budgets(), **(budgets or {})}
     state = _make_state(question, qid=qid or "unknown", budgets=budgets)
     logs = []
+    fallback_stop_was_used = False
+
+    def _should_debug(qid_value: str) -> bool:
+        try:
+            return int(qid_value) < 3
+        except Exception:
+            return False
 
     for _ in range(budgets["max_steps"]):
         obs = build_features(state)
         action_idx = controller.act(obs, state)
         action = Action(action_idx)
+
+        if _should_debug(state.qid):
+            print(f"[run_episode][debug] qid={state.qid} step={state.step} action_idx={action_idx} action={action.name}", flush=True)
 
         # Early-stop safeguard: when controller tries to stop while still uncertain,
         # run one cheap verification first if there is remaining budget.
@@ -164,11 +174,20 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             action = Action.VERIFY_CHEAP
 
         costs = execute_action(state, action, controller, tools)
-        logs.append({"step": state.step, "action": int(action), "costs": costs, "metrics": dict(state.metrics)})
+        logs.append({"step": state.step, "action": int(action), "action_name": action.name, "costs": costs, "metrics": dict(state.metrics)})
 
         if action == Action.STOP_AND_ANSWER or state.metrics["retrieval_calls"] >= budgets["max_retrieval_calls"]:
             if not state.final_answer:
                 execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
+                fallback_stop_was_used = True
             break
 
-    return state.final_answer, {"state": asdict(state), "steps": logs}
+    # Always force a final answer if rollout exhausted max_steps without explicit answer.
+    if not state.final_answer:
+        execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
+        fallback_stop_was_used = True
+
+    out = {"state": asdict(state), "steps": logs, "fallback_stop_was_used": fallback_stop_was_used}
+    out["state"].setdefault("metrics", {})
+    out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
+    return state.final_answer, out

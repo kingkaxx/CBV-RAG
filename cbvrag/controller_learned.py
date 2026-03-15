@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import torch
 
 from rl.policy import build_policy, policy_config_from_checkpoint
+from cbvrag.actions import Action
 
 
 class LearnedController:
@@ -16,7 +17,13 @@ class LearnedController:
         self.trace: List[Dict[str, Any]] = []
         self.ckpt = torch.load(policy_ckpt, map_location="cpu")
         cfg = policy_config_from_checkpoint(self.ckpt)
+        expected_act_dim = len(Action)
+        if int(cfg.act_dim) != expected_act_dim:
+            raise ValueError(
+                f"Policy checkpoint act_dim={cfg.act_dim} does not match Action enum size={expected_act_dim}."
+            )
         self.history_len = max(1, cfg.history_len)
+        self._debug_print_limit = 8
         self._history: deque[list[float]] = deque(maxlen=self.history_len)
         self.model = build_policy(cfg)
         self.model.load_state_dict(self.ckpt["state_dict"])
@@ -57,5 +64,12 @@ class LearnedController:
         else:
             action = int(torch.argmax(logits).item())
 
-        self.trace.append({"obs": list(obs), "action": action, "reward": 0.0, "done": False, "info": {}})
+        action_name = Action(action).name if 0 <= action < len(Action) else f"INVALID_{action}"
+        if len(self.trace) < self._debug_print_limit:
+            print(
+                f"[LearnedController][debug] step={state.step} mode={self.mode} action_idx={action} action={action_name}",
+                flush=True,
+            )
+
+        self.trace.append({"obs": list(obs), "action": action, "reward": 0.0, "done": False, "info": {"action_name": action_name, "step": state.step}})
         return action
