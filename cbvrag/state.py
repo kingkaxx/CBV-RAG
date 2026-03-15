@@ -13,6 +13,7 @@ class EvidenceItem:
     rerank_score: float
     short_claim: str
     branch_id: str
+    title: str = ""
 
 
 @dataclass

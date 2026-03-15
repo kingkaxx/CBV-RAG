@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from statistics import mean
 from typing import Dict, List
@@ -15,6 +16,15 @@ from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
 from retriever import KnowledgeBaseRetriever
 from rl.reward import RewardConfig, compute_reward_components
+from rl.trace_oracles import (
+    TrajectoryScoreConfig,
+    build_oracle_controller,
+    compute_episode_quality,
+    estimate_case_profile,
+    parse_oracle_mix,
+    sample_oracle_name,
+    score_trajectory,
+)
 from tools.llm import LLMEngine
 from tools.rerank import CrossEncoderReranker
 from tools.retrieve import RetrieverTool
@@ -47,19 +57,37 @@ def main() -> int:
     ap.add_argument("--output", default=None)
     ap.add_argument("--num_samples", type=int, default=None)
     ap.add_argument("--llm_device", default=None)
+    ap.add_argument("--trace_policy", choices=["heuristic", "mixture"], default="heuristic")
+    ap.add_argument("--num_candidates_per_example", type=int, default=4)
+    ap.add_argument("--oracle_mix", default=None)
+    ap.add_argument("--keep_top_n_per_example", type=int, default=1)
+    ap.add_argument("--allow_near_success", action="store_true")
+
     ap.add_argument("--keep_only_successful", action="store_true")
     ap.add_argument("--min_episode_reward", type=float, default=None)
     ap.add_argument("--max_episode_tokens", type=int, default=None)
     ap.add_argument("--max_episode_steps", type=int, default=None)
     ap.add_argument("--progress_every", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument("--correctness_reward", type=float, default=1.0)
     ap.add_argument("--token_penalty", type=float, default=0.001)
     ap.add_argument("--retrieval_penalty", type=float, default=0.05)
     ap.add_argument("--branch_penalty", type=float, default=0.1)
     ap.add_argument("--verify_bonus", type=float, default=0.02)
     ap.add_argument("--early_stop_bonus", type=float, default=0.05)
+
+    ap.add_argument("--score_success_reward", type=float, default=3.0)
+    ap.add_argument("--score_em_reward", type=float, default=1.5)
+    ap.add_argument("--score_f1_reward", type=float, default=1.0)
+    ap.add_argument("--score_support_reward", type=float, default=0.75)
+    ap.add_argument("--score_token_penalty", type=float, default=0.001)
+    ap.add_argument("--score_step_penalty", type=float, default=0.03)
+    ap.add_argument("--score_branch_penalty", type=float, default=0.06)
+    ap.add_argument("--score_redundant_verify_penalty", type=float, default=0.03)
     args = ap.parse_args()
 
+    rng = random.Random(args.seed)
     llm_device = resolve_llm_device(args.llm_device)
     print(f"[collect_traces] LLM device: {llm_device}", flush=True)
 
@@ -74,6 +102,17 @@ def main() -> int:
         verify_bonus=args.verify_bonus,
         early_stop_bonus=args.early_stop_bonus,
     )
+    score_cfg = TrajectoryScoreConfig(
+        success_reward=args.score_success_reward,
+        em_reward=args.score_em_reward,
+        f1_reward=args.score_f1_reward,
+        support_reward=args.score_support_reward,
+        token_penalty=args.score_token_penalty,
+        step_penalty=args.score_step_penalty,
+        branch_penalty=args.score_branch_penalty,
+        redundant_verify_penalty=args.score_redundant_verify_penalty,
+    )
+    oracle_mix = parse_oracle_mix(args.oracle_mix)
 
     models = model_loader.load_all_models()
     retriever = KnowledgeBaseRetriever(models["embedding_model"])
@@ -94,94 +133,190 @@ def main() -> int:
     step_counts: List[int] = []
     token_counts: List[int] = []
     retrieval_counts: List[int] = []
-    prev_total_tokens = 0
 
     with output.open("w", encoding="utf-8") as f:
         for i, ex in enumerate(data):
             qid = str(ex.get("id", i))
 
-            # For datasets like HotpotQA that include per-example context, build a temporary
-            # in-memory retrieval index so trace collection does not depend on knowledge_base/.
             context_docs = ex.get("context") if isinstance(ex, dict) else None
             if context_docs:
                 retriever.build_temp_index_from_docs(context_docs)
-                # Avoid cross-example cache collisions: use per-qid retrieval cache dir.
                 tools["retrieve"] = RetrieverTool(retriever, cache_dir=f"./cache/retrieval/{args.dataset}/{qid}")
-                print(
-                    f"[collect_traces] built temporary retrieval index for qid={qid} "
-                    f"with {len(context_docs)} context docs",
-                    flush=True,
-                )
             else:
                 retriever.clear_temp_index()
                 tools["retrieve"] = RetrieverTool(retriever)
 
-            controller = HeuristicController()
-            pred, log = run_episode(ex["question"], controller, tools, qid=qid)
-            golds = ex.get("answer") or [""]
-            correct = any(g.lower() in pred.lower() for g in golds)
+            num_candidates = 1 if args.trace_policy == "heuristic" else max(1, args.num_candidates_per_example)
+            candidate_infos = []
 
-            state_metrics = log.get("state", {}).get("metrics", {})
-            running_total_tokens = int(tools["llm"].usage_tracker.summary().get("total_tokens", 0))
-            total_tokens = max(0, running_total_tokens - prev_total_tokens)
-            prev_total_tokens = running_total_tokens
-            retrieval_calls = int(state_metrics.get("retrieval_calls", 0))
-            verify_calls = int(state_metrics.get("verify_calls", 0))
-            llm_calls = int(state_metrics.get("llm_calls", 0))
-            episode_steps = len(controller.trace)
-            num_branches = len(log.get("state", {}).get("branches", {}))
-            early_stop = episode_steps < log.get("state", {}).get("budgets", {}).get("max_steps", episode_steps)
+            for cand_idx in range(num_candidates):
+                running_before = int(tools["llm"].usage_tracker.summary().get("total_tokens", 0))
 
-            rewards = compute_reward_components(
-                terminal_correct=bool(correct),
-                tokens_used=total_tokens,
-                retrieval_calls=retrieval_calls,
-                branches_created=max(0, num_branches - 1),
-                verify_calls=verify_calls,
-                early_stop=early_stop,
-                cfg=reward_cfg,
-            )
-            episode_total_reward = rewards["total"]
+                if args.trace_policy == "heuristic":
+                    controller = HeuristicController()
+                    oracle_name = "heuristic"
+                    case_profile = "standard"
+                else:
+                    case_profile = estimate_case_profile(
+                        type(
+                            "S",
+                            (),
+                            {
+                                "metrics": {"retrieval_calls": 0},
+                                "branches": {"b0": object()},
+                                "selected_evidence_ids": [],
+                                "evidence_pool": {},
+                                "budgets": {"max_branches": 3, "max_retrieval_calls": 5},
+                            },
+                        )
+                    )
+                    oracle_name = sample_oracle_name(case_profile, oracle_mix, rng)
+                    controller = build_oracle_controller(oracle_name, seed=args.seed + i * 97 + cand_idx)
 
-            if args.keep_only_successful and not correct:
-                continue
-            if args.min_episode_reward is not None and episode_total_reward < args.min_episode_reward:
-                continue
-            if args.max_episode_tokens is not None and total_tokens > args.max_episode_tokens:
-                continue
-            if args.max_episode_steps is not None and episode_steps > args.max_episode_steps:
-                continue
+                pred, log = run_episode(ex["question"], controller, tools, qid=f"{qid}-{cand_idx}")
+                running_after = int(tools["llm"].usage_tracker.summary().get("total_tokens", 0))
+                cand_tokens = max(0, running_after - running_before)
 
-            episodes_completed += 1
-            success_count += int(bool(correct))
-            step_counts.append(episode_steps)
-            token_counts.append(total_tokens)
-            retrieval_counts.append(retrieval_calls)
+                state_metrics = log.get("state", {}).get("metrics", {})
+                retrieval_calls = int(state_metrics.get("retrieval_calls", 0))
+                verify_calls = int(state_metrics.get("verify_calls", 0))
+                llm_calls = int(state_metrics.get("llm_calls", 0))
+                episode_steps = len(controller.trace)
+                num_branches = len(log.get("state", {}).get("branches", {}))
+                early_stop = episode_steps < log.get("state", {}).get("budgets", {}).get("max_steps", episode_steps)
 
-            for t, tr in enumerate(controller.trace):
-                row = {
-                    "qid": qid,
-                    "episode_id": f"{qid}::0",
-                    "episode_index": i,
-                    "episode_step_index": t,
-                    "episode_num_steps": episode_steps,
-                    "obs": tr["obs"],
-                    "action": tr["action"],
-                    "reward": tr.get("reward", 0.0),
-                    "reward_components": rewards,
-                    "done": t == len(controller.trace) - 1,
-                    "success": bool(correct),
-                    "terminal_correct": bool(correct),
-                    "info": log.get("steps", []),
-                    "episode_total_reward": episode_total_reward,
-                    "episode_total_tokens": total_tokens,
-                    "episode_total_retrieval_calls": retrieval_calls,
-                    "episode_total_verify_calls": verify_calls,
-                    "episode_total_llm_calls": llm_calls,
-                    "episode_num_branches": num_branches,
+                golds = ex.get("answer") or [""]
+                em, f1, success = compute_episode_quality(pred, golds)
+                support_titles = set(ex.get("support_titles") or [])
+                retrieved_titles = {
+                    (ev.get("title") or "").strip()
+                    for ev in (log.get("state", {}).get("evidence_pool", {}) or {}).values()
+                    if isinstance(ev, dict)
                 }
-                f.write(json.dumps(row) + "\n")
-                rows_written += 1
+                support_hit = 1.0 if (support_titles and (retrieved_titles & support_titles)) else 0.0
+
+                rewards = compute_reward_components(
+                    terminal_correct=bool(success),
+                    tokens_used=cand_tokens,
+                    retrieval_calls=retrieval_calls,
+                    branches_created=max(0, num_branches - 1),
+                    verify_calls=verify_calls,
+                    early_stop=early_stop,
+                    cfg=reward_cfg,
+                )
+                episode_total_reward = rewards["total"]
+
+                trajectory_score = score_trajectory(
+                    success=bool(success),
+                    em=em,
+                    f1=f1,
+                    support_hit=support_hit,
+                    tokens_used=cand_tokens,
+                    steps=episode_steps,
+                    branches=num_branches,
+                    verify_calls=verify_calls,
+                    cfg=score_cfg,
+                )
+
+                candidate_infos.append(
+                    {
+                        "cand_idx": cand_idx,
+                        "pred": pred,
+                        "log": log,
+                        "controller": controller,
+                        "tokens": cand_tokens,
+                        "retrieval_calls": retrieval_calls,
+                        "verify_calls": verify_calls,
+                        "llm_calls": llm_calls,
+                        "steps": episode_steps,
+                        "num_branches": num_branches,
+                        "early_stop": early_stop,
+                        "success": bool(success),
+                        "em": float(em),
+                        "f1": float(f1),
+                        "support_hit": support_hit,
+                        "rewards": rewards,
+                        "episode_total_reward": episode_total_reward,
+                        "trajectory_score": trajectory_score,
+                        "oracle_name": oracle_name,
+                        "case_profile": case_profile,
+                        "fallback_stop_was_used": bool(log.get("fallback_stop_was_used", False)),
+                    }
+                )
+
+            candidate_infos.sort(
+                key=lambda c: (
+                    1 if c["success"] else 0,
+                    c["trajectory_score"],
+                    c["f1"],
+                    -c["tokens"],
+                ),
+                reverse=True,
+            )
+
+            kept = candidate_infos[: max(1, args.keep_top_n_per_example)]
+            if args.allow_near_success and not any(c["success"] for c in kept):
+                kept = candidate_infos[: max(1, args.keep_top_n_per_example)]
+
+            for rank, cand in enumerate(kept, start=1):
+                if args.keep_only_successful and not cand["success"]:
+                    continue
+                if args.min_episode_reward is not None and cand["episode_total_reward"] < args.min_episode_reward:
+                    continue
+                if args.max_episode_tokens is not None and cand["tokens"] > args.max_episode_tokens:
+                    continue
+                if args.max_episode_steps is not None and cand["steps"] > args.max_episode_steps:
+                    continue
+
+                episodes_completed += 1
+                success_count += int(bool(cand["success"]))
+                step_counts.append(cand["steps"])
+                token_counts.append(cand["tokens"])
+                retrieval_counts.append(cand["retrieval_calls"])
+
+                trace = cand["controller"].trace
+                for t, tr in enumerate(trace):
+                    info = tr.get("info", {}) if isinstance(tr, dict) else {}
+                    row = {
+                        "qid": qid,
+                        "episode_id": f"{qid}::{cand['cand_idx']}",
+                        "episode_index": i,
+                        "episode_step_index": t,
+                        "episode_num_steps": cand["steps"],
+                        "obs": tr["obs"],
+                        "action": tr["action"],
+                        "reward": tr.get("reward", 0.0),
+                        "reward_components": cand["rewards"],
+                        "done": t == len(trace) - 1,
+                        "success": bool(cand["success"]),
+                        "terminal_correct": bool(cand["success"]),
+                        "info": cand["log"].get("steps", []),
+                        "episode_total_reward": cand["episode_total_reward"],
+                        "episode_total_tokens": cand["tokens"],
+                        "episode_total_retrieval_calls": cand["retrieval_calls"],
+                        "episode_total_verify_calls": cand["verify_calls"],
+                        "episode_total_llm_calls": cand["llm_calls"],
+                        "episode_num_branches": cand["num_branches"],
+                        "episode_final_fallback_stop": cand["fallback_stop_was_used"],
+                        # richer optional schema
+                        "oracle_name": cand["oracle_name"],
+                        "case_profile": cand["case_profile"],
+                        "candidate_rank": rank,
+                        "trajectory_score": cand["trajectory_score"],
+                        "state_features": tr.get("obs", []),
+                        "action_reason": info.get("action_reason", ""),
+                        "tokens_before": None,
+                        "tokens_after": None,
+                        "branches_before": None,
+                        "branches_after": None,
+                        "retrieval_calls_before": None,
+                        "retrieval_calls_after": None,
+                        "was_successful": bool(cand["success"]),
+                        "final_em": cand["em"],
+                        "final_f1": cand["f1"],
+                    }
+                    f.write(json.dumps(row) + "\n")
+                    rows_written += 1
 
             if (i + 1) % max(1, args.progress_every) == 0 or i + 1 == total:
                 print(
@@ -196,6 +331,9 @@ def main() -> int:
 
     summary = {
         "dataset": args.dataset,
+        "trace_policy": args.trace_policy,
+        "num_candidates_per_example": args.num_candidates_per_example,
+        "keep_top_n_per_example": args.keep_top_n_per_example,
         "output": str(output),
         "total_examples": total,
         "episodes_written": episodes_completed,
