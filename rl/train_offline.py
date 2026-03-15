@@ -101,10 +101,15 @@ def main() -> int:
     ap.add_argument("--disable_verification_reward", action="store_true")
     ap.add_argument("--disable_efficiency_penalty", action="store_true")
     ap.add_argument("--disable_counterfactual_discrimination_reward", action="store_true")
+    ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
     args = ap.parse_args()
 
     set_seed(args.seed)
     rows = load_rows(args.traces)
+    if args.filter_min_trajectory_score is not None:
+        rows = [r for r in rows if float(r.get("trajectory_score", 0.0)) >= args.filter_min_trajectory_score]
+    if not rows:
+        raise ValueError("No traces left after filtering; lower --filter_min_trajectory_score or check input")
     obs = torch.tensor([r["obs"] for r in rows], dtype=torch.float32)
     act = torch.tensor([r["action"] for r in rows], dtype=torch.long)
 
@@ -130,6 +135,8 @@ def main() -> int:
     val_obs = val_act = val_rew = None
     if args.val_traces:
         val_rows = load_rows(args.val_traces)
+        if args.filter_min_trajectory_score is not None:
+            val_rows = [r for r in val_rows if float(r.get("trajectory_score", 0.0)) >= args.filter_min_trajectory_score]
         if val_rows:
             val_obs = torch.tensor([r["obs"] for r in val_rows], dtype=torch.float32)
             val_act = torch.tensor([r["action"] for r in val_rows], dtype=torch.long)
