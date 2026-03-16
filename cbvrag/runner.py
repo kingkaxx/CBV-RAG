@@ -4,6 +4,8 @@ from dataclasses import asdict
 from typing import Any, Dict, Tuple
 
 from cbvrag.actions import Action
+from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
+from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.features import build_features
 from cbvrag.prompts import answer_prompt, counterfactual_prompt, verify_prompt
 from cbvrag.state import Branch, EpisodeState, EvidenceItem
@@ -32,6 +34,77 @@ def _make_state(question: str, qid: str, budgets: Dict) -> EpisodeState:
     )
 
 
+
+
+def _pool_as_dicts(state: EpisodeState) -> list[dict]:
+    selected = set(state.selected_evidence_ids)
+    return [
+        {
+            "evidence_id": e.evidence_id,
+            "doc_id": e.doc_id,
+            "chunk_id": e.chunk_id,
+            "title": e.title,
+            "rerank_score": float(e.rerank_score),
+            "retriever_score": float(e.retriever_score),
+            "text": e.short_claim,
+            "is_selected": e.evidence_id in selected,
+            "branch_id": e.branch_id,
+        }
+        for e in state.evidence_pool.values()
+    ]
+
+
+def _update_cluster_specificity_metrics(state: EpisodeState) -> None:
+    items = _pool_as_dicts(state)
+    clusters = cluster_evidence_items(items)
+    cluster_stats = summarize_cluster_stats(clusters)
+    cluster_map = {}
+    for c in clusters:
+        cid = c.get("cluster_id", "")
+        for eid in c.get("member_ids", []) or []:
+            cluster_map[eid] = cid
+
+    retrieved_by_query = {
+        "original": [dict(it, cluster_id=cluster_map.get(str(it.get("evidence_id", "")), "")) for it in items]
+    }
+    spec = score_evidence_specificity(state.question, {"original": state.question, "variants": []}, retrieved_by_query)
+    selected = [eid for eid in state.selected_evidence_ids if eid in spec.get("chunk_scores", {})]
+    selected_scores = [spec["chunk_scores"][eid] for eid in selected]
+    best_spec = max([float(v.get("specificity", 0.0)) for v in spec.get("chunk_scores", {}).values()] or [0.0])
+    best_resist = max([float(v.get("counterfactual_resistance", 0.0)) for v in spec.get("chunk_scores", {}).values()] or [0.0])
+    mean_sel_spec = sum(float(v.get("specificity", 0.0)) for v in selected_scores) / max(1, len(selected_scores))
+
+    sel_clusters = [cluster_map.get(eid, "") for eid in state.selected_evidence_ids if cluster_map.get(eid, "")]
+    selected_cluster_count = len(set(sel_clusters))
+    same_cluster_frac = 0.0
+    if sel_clusters:
+        same_cluster_frac = max(sel_clusters.count(c) for c in set(sel_clusters)) / max(1, len(sel_clusters))
+
+    state.metrics.update(
+        {
+            **cluster_stats,
+            "selected_cluster_count": float(selected_cluster_count),
+            "selected_cluster_diversity": float(selected_cluster_count / max(1, int(cluster_stats.get("num_clusters", 0) or 1))),
+            "selected_same_cluster_frac": float(same_cluster_frac),
+            "evidence_redundancy_proxy": float(same_cluster_frac),
+            "multi_cluster_support_flag": 1.0 if selected_cluster_count >= 2 else 0.0,
+            "best_specificity_score": float(best_spec),
+            "mean_specificity_selected": float(mean_sel_spec),
+            "best_counterfactual_resistance": float(best_resist),
+            "candidate_count_available": float(selected_cluster_count),
+            "candidate_score_gap_top2": 0.0,
+            "view_disagreement_score": 0.0,
+            "original_specific_cluster_count": float(sum(1 for c in clusters if float(c.get("mean_rerank", 0.0)) >= 0.0)),
+            "cluster_stats": cluster_stats,
+            "specificity_stats": {
+                "best_specificity_score": float(best_spec),
+                "mean_specificity_selected": float(mean_sel_spec),
+                "best_counterfactual_resistance": float(best_resist),
+            },
+        }
+    )
+
+
 def execute_action(state: EpisodeState, action: Action, controller: Any, tools: Dict[str, Any]) -> Dict[str, Any]:
     step_costs = {"tokens_used_this_step": 0, "retrieval_calls_this_step": 0, "new_branch_created": 0}
     retriever = tools["retrieve"]
@@ -57,6 +130,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
                 branch_id=state.active_branch_id,
                 title=str(c.get("title") or c.get("meta", {}).get("title", "")),
             )
+        _update_cluster_specificity_metrics(state)
 
     elif action == Action.SELECT_CONTEXT:
         pool = [
@@ -79,6 +153,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
             max_tokens=state.budgets["max_context_tokens"],
         )
         state.selected_evidence_ids = [s["evidence_id"] for s in selected]
+        _update_cluster_specificity_metrics(state)
 
     elif action == Action.SPAWN_COUNTERFACTUAL and len(state.branches) < state.budgets["max_branches"]:
         prompt = counterfactual_prompt(state.question, "counter")
@@ -149,6 +224,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     fallback_stop_was_used = False
     explicit_stop_used = False
     forced_stop_used = False
+    explicit_terminal_action = None
 
     def _should_debug(qid_value: str) -> bool:
         try:
@@ -195,6 +271,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         except TypeError:
             action_idx = controller.act(obs, state)
         controller_action = Action(action_idx)
+        requested_action = controller_action
         action = controller_action
         action_was_forced = False
 
@@ -265,6 +342,11 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 "step": state.step,
                 "action": int(action),
                 "action_name": action.name,
+                "requested_action": int(requested_action),
+                "requested_action_name": requested_action.name,
+                "executed_action": int(action),
+                "action_was_forced": bool(action_was_forced),
+                "action_mask": list(action_mask),
                 "costs": costs,
                 "metrics": dict(state.metrics),
                 "selected_evidence_changed": selected_evidence_changed,
@@ -284,6 +366,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                     forced_stop_used = True
                 else:
                     explicit_stop_used = True
+                explicit_terminal_action = int(action)
             if not state.final_answer:
                 execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
                 fallback_stop_was_used = True
@@ -313,9 +396,11 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         "fallback_stop_was_used": fallback_stop_was_used,
         "explicit_stop_used": explicit_stop_used,
         "forced_stop_used": forced_stop_used,
+        "explicit_terminal_action": explicit_terminal_action,
     }
     out["state"].setdefault("metrics", {})
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
     out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
     out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
+    out["state"]["metrics"]["explicit_terminal_action"] = int(explicit_terminal_action) if explicit_terminal_action is not None else -1
     return state.final_answer, out

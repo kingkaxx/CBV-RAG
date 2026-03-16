@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from cbvrag.actions import Action
 from rl.policy import PolicyConfig, build_policy
 from rl.reward import RewardConfig, compute_reward_components
 
@@ -142,7 +143,11 @@ def main() -> int:
             val_act = torch.tensor([r["action"] for r in val_rows], dtype=torch.long)
             val_rew = build_reward_tensor(val_rows, reward_cfg, success_bonus=args.success_bonus)
 
-    act_dim = int(max(act.max().item(), val_act.max().item() if val_act is not None else 0)) + 1
+    act_dim = len(Action)
+    if int(act.max().item()) >= act_dim or int(act.min().item()) < 0:
+        raise ValueError(f"Train traces contain action ids outside Action enum range [0, {act_dim - 1}].")
+    if val_act is not None and (int(val_act.max().item()) >= act_dim or int(val_act.min().item()) < 0):
+        raise ValueError(f"Val traces contain action ids outside Action enum range [0, {act_dim - 1}].")
     cfg = PolicyConfig(
         policy_type=args.policy_type,
         obs_dim=obs.shape[1],

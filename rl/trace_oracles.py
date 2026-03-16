@@ -166,6 +166,8 @@ class SafeOracle(OracleControllerBase):
             return self._log(obs, Action.VERIFY_CHEAP, state, "cheap_safety_check")
         if state.verification_status == "unknown" and step <= 5:
             return self._log(obs, Action.VERIFY_LLM, state, "escalate_verification")
+        if _selected_count(state) >= 1:
+            return self._log(obs, Action.ANSWER_DIRECT, state, "safe_finish_direct")
         return self._log(obs, Action.STOP_AND_ANSWER, state, "safe_finish")
 
 
@@ -205,7 +207,7 @@ class DeliberativeOracle(OracleControllerBase):
             return self._log(obs, Action.VERIFY_LLM, state, "llm_verify_for_hard_case")
         if _selected_count(state) < 2:
             return self._log(obs, Action.RETRIEVE_MORE_SMALL, state, "top_up_before_finalize")
-        return self._log(obs, Action.STOP_AND_ANSWER, state, "deliberative_finish")
+        return self._log(obs, Action.ANSWER_DIRECT, state, "deliberative_finish_direct")
 
 
 ORACLE_REGISTRY = {

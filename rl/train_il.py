@@ -80,6 +80,7 @@ def main() -> int:
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--history_len", type=int, default=1)
     ap.add_argument("--use_action_weights", action="store_true")
+    ap.add_argument("--terminal_action_boost", type=float, default=1.0)
     ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
     args = ap.parse_args()
 
@@ -115,10 +116,23 @@ def main() -> int:
     model = build_policy(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    weights = None
     if args.use_action_weights:
         counts = torch.bincount(y_train, minlength=act_dim).float()
         weights = torch.where(counts > 0, 1.0 / counts, torch.zeros_like(counts))
         if weights.sum() > 0:
+            weights = weights / weights.mean().clamp_min(1e-6)
+
+    if args.terminal_action_boost != 1.0:
+        if args.terminal_action_boost <= 0:
+            raise ValueError("--terminal_action_boost must be > 0")
+        if weights is None:
+            weights = torch.ones(act_dim, dtype=torch.float32)
+        for terminal_action in (int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)):
+            weights[terminal_action] *= float(args.terminal_action_boost)
+
+    if weights is not None:
+        if weights.mean() > 0:
             weights = weights / weights.mean().clamp_min(1e-6)
         loss_fn = nn.CrossEntropyLoss(weight=weights.to(device))
     else:
@@ -174,6 +188,7 @@ def main() -> int:
             "batch_size": args.batch_size,
             "lr": args.lr,
             "use_action_weights": bool(args.use_action_weights),
+            "terminal_action_boost": args.terminal_action_boost,
             "filter_min_trajectory_score": args.filter_min_trajectory_score,
         },
     }

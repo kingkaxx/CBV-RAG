@@ -5,7 +5,7 @@ from typing import List
 from cbvrag.state import EpisodeState
 
 
-FEATURE_SCHEMA_VERSION = "cbvrag_features_v2"
+FEATURE_SCHEMA_VERSION = "cbvrag_features_v4"
 
 
 def _one_hot_verification(status: str) -> List[float]:
@@ -38,6 +38,25 @@ def build_features(state: EpisodeState) -> List[float]:
     no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
     selected_changed = float(state.metrics.get("selected_evidence_changed", 0))
     pool_changed = float(state.metrics.get("evidence_pool_changed", 0))
+
+    num_clusters = float(state.metrics.get("num_clusters", 0.0))
+    largest_cluster_size = float(state.metrics.get("largest_cluster_size", 0.0))
+    largest_cluster_frac = float(state.metrics.get("largest_cluster_frac", 0.0))
+    top_cluster_mean_rerank = float(state.metrics.get("top_cluster_mean_rerank", 0.0))
+    second_cluster_mean_rerank = float(state.metrics.get("second_cluster_mean_rerank", 0.0))
+    cluster_gap = float(state.metrics.get("cluster_gap", 0.0))
+    selected_cluster_count = float(state.metrics.get("selected_cluster_count", 0.0))
+    selected_cluster_diversity = float(state.metrics.get("selected_cluster_diversity", 0.0))
+    selected_same_cluster_frac = float(state.metrics.get("selected_same_cluster_frac", 0.0))
+    evidence_redundancy_proxy = float(state.metrics.get("evidence_redundancy_proxy", 0.0))
+    multi_cluster_support_flag = float(state.metrics.get("multi_cluster_support_flag", 0.0))
+    best_specificity_score = float(state.metrics.get("best_specificity_score", 0.0))
+    mean_specificity_selected = float(state.metrics.get("mean_specificity_selected", 0.0))
+    best_counterfactual_resistance = float(state.metrics.get("best_counterfactual_resistance", 0.0))
+    candidate_count_available = float(state.metrics.get("candidate_count_available", 0.0))
+    candidate_score_gap_top2 = float(state.metrics.get("candidate_score_gap_top2", 0.0))
+    view_disagreement_score = float(state.metrics.get("view_disagreement_score", 0.0))
+    original_specific_cluster_count = float(state.metrics.get("original_specific_cluster_count", 0.0))
 
     # existing/core features first (backward-compat ordering)
     vec = [
@@ -79,6 +98,8 @@ def build_features(state: EpisodeState) -> List[float]:
     near_retrieval_exhaustion = 1.0 if retrieval_calls >= max(1, max_retrieval - 1) else 0.0
     near_step_exhaustion = 1.0 if state.step >= max(1, max_steps - 1) else 0.0
     context_pressure = selected_count / max_context_chunks
+    selected_nonempty = 1.0 if selected_count > 0 else 0.0
+    retrieval_nonempty = 1.0 if retrieval_calls > 0 else 0.0
     score_std_proxy = abs(best - mean_topk)
     conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
 
@@ -100,6 +121,8 @@ def build_features(state: EpisodeState) -> List[float]:
             near_retrieval_exhaustion,
             near_step_exhaustion,
             context_pressure,
+            selected_nonempty,
+            retrieval_nonempty,
             float(len(unique_titles)),
             score_std_proxy,
             conflicting_evidence,
@@ -111,6 +134,30 @@ def build_features(state: EpisodeState) -> List[float]:
         ]
     )
     vec.extend(last_action_onehot)
+
+    # cluster/specificity candidate-aware features (stable append-only ordering)
+    vec.extend(
+        [
+            num_clusters,
+            largest_cluster_size,
+            largest_cluster_frac,
+            top_cluster_mean_rerank,
+            second_cluster_mean_rerank,
+            cluster_gap,
+            selected_cluster_count,
+            selected_cluster_diversity,
+            selected_same_cluster_frac,
+            evidence_redundancy_proxy,
+            multi_cluster_support_flag,
+            best_specificity_score,
+            mean_specificity_selected,
+            best_counterfactual_resistance,
+            candidate_count_available,
+            candidate_score_gap_top2,
+            view_disagreement_score,
+            original_specific_cluster_count,
+        ]
+    )
     return [float(v) for v in vec]
 
 
