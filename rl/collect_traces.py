@@ -109,6 +109,21 @@ def _is_short_successful_stop_bucket(cand: Dict) -> bool:
     return len(seq) <= 4 and int(Action.VERIFY_CHEAP) in seq
 
 
+
+
+def _is_preferred_short_stop_sequence(seq: List[int]) -> bool:
+    preferred = {
+        (int(Action.RETRIEVE_MORE_LARGE), int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.VERIFY_CHEAP), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_LARGE), int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.VERIFY_CHEAP), int(Action.STOP_AND_ANSWER)),
+    }
+    return tuple(seq) in preferred
+
 def _pick_shortest_successful_terminal(pool: List[Dict], action: Action) -> Dict | None:
     matches = [c for c in pool if c.get("success", False) and _last_action_is(c, action)]
     if not matches:
@@ -143,6 +158,11 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
 
     # Retention bucket: preserve short successful explicit-stop traces even if a longer trace scores slightly higher.
     short_successful_stops = [c for c in pool if _is_short_successful_stop_bucket(c)]
+    preferred_short_stops = [c for c in short_successful_stops if _is_preferred_short_stop_sequence(c.get("action_sequence", []))]
+    for c in sorted(preferred_short_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
+        if len(chosen) >= keep_n:
+            break
+        _add_if_new(c)
     for c in sorted(short_successful_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
         if len(chosen) >= keep_n:
             break
@@ -357,7 +377,7 @@ def main() -> int:
                     trajectory_score += 0.25 * (1.0 if explicit_early_stop else 0.0)
                     if explicit_terminal and had_selected_evidence:
                         trajectory_score += 0.45
-                        trajectory_score += 0.10 * (1.0 if final_action == int(Action.STOP_AND_ANSWER) else 0.0)
+                        trajectory_score += 0.10
                         trajectory_score -= 0.07 * max(0, verify_steps - 1)
 
                 # penalize repeated VERIFY_CHEAP especially when status does not improve

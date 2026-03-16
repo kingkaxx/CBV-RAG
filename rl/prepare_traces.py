@@ -8,19 +8,36 @@ from pathlib import Path
 from statistics import mean
 from typing import Dict, List
 
+from cbvrag.actions import Action
+
 
 def load_rows(path: Path) -> List[Dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def episode_passes(row: Dict, args: argparse.Namespace) -> bool:
-    if args.only_successful and not bool(row.get("success", row.get("terminal_correct", False))):
+def _step_sort_key(row: Dict) -> tuple[int, int]:
+    idx = row.get("episode_step_index")
+    step = row.get("step")
+    idx_v = int(idx) if idx is not None else 10**9
+    step_v = int(step) if step is not None else idx_v
+    return idx_v, step_v
+
+
+def get_terminal_row(erows: List[Dict]) -> Dict:
+    done_rows = [r for r in erows if bool(r.get("done", False))]
+    if done_rows:
+        return max(done_rows, key=_step_sort_key)
+    return max(erows, key=_step_sort_key)
+
+
+def episode_passes(terminal_row: Dict, args: argparse.Namespace) -> bool:
+    if args.only_successful and not bool(terminal_row.get("success", terminal_row.get("terminal_correct", False))):
         return False
-    if args.min_episode_reward is not None and float(row.get("episode_total_reward", 0.0)) < args.min_episode_reward:
+    if args.min_episode_reward is not None and float(terminal_row.get("episode_total_reward", 0.0)) < args.min_episode_reward:
         return False
-    if args.max_episode_tokens is not None and int(row.get("episode_total_tokens", 0)) > args.max_episode_tokens:
+    if args.max_episode_tokens is not None and int(terminal_row.get("episode_total_tokens", 0)) > args.max_episode_tokens:
         return False
-    if args.filter_min_trajectory_score is not None and float(row.get("trajectory_score", 0.0)) < args.filter_min_trajectory_score:
+    if args.filter_min_trajectory_score is not None and float(terminal_row.get("trajectory_score", 0.0)) < args.filter_min_trajectory_score:
         return False
     return True
 
@@ -48,6 +65,26 @@ def _action_hist(rows: List[Dict]) -> Dict[str, int]:
     return {str(k): int(v) for k, v in sorted(c.items()) if k >= 0}
 
 
+def _terminal_action_hist(episodes: Dict[str, List[Dict]]) -> Dict[str, int]:
+    c = Counter()
+    for erows in episodes.values():
+        trow = get_terminal_row(erows)
+        c[int(trow.get("action", -1))] += 1
+    return {str(k): int(v) for k, v in sorted(c.items()) if k >= 0}
+
+
+
+
+
+def _warn_terminal_action_disappearance(kept_terminal_hist: Dict[str, int], train_terminal_hist: Dict[str, int]) -> None:
+    for action_idx in (int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)):
+        a = str(action_idx)
+        if int(kept_terminal_hist.get(a, 0)) > 0 and int(train_terminal_hist.get(a, 0)) == 0:
+            print(
+                f"[prepare_traces][warn] terminal action {action_idx} present in kept episodes but missing from train terminal split",
+                flush=True,
+            )
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -67,33 +104,42 @@ def main() -> int:
     rows = load_rows(Path(args.input))
     episodes = build_episode_groups(rows)
 
-    # Filter at episode level.
-    kept_episodes = {}
+    kept_episodes: Dict[str, List[Dict]] = {}
     filtered_episodes = 0
+    missing_terminal_warning_count = 0
+    episode_meta: Dict[str, Dict] = {}
+
     for eid, erows in episodes.items():
-        exemplar = erows[0]
-        if not episode_passes(exemplar, args):
+        sorted_rows = sorted(erows, key=_step_sort_key)
+        terminal_row = get_terminal_row(sorted_rows)
+        if not any(bool(r.get("done", False)) for r in sorted_rows):
+            missing_terminal_warning_count += 1
+            print(f"[prepare_traces][warn] episode={eid} has no done=True row; using latest step as terminal row", flush=True)
+
+        if not episode_passes(terminal_row, args):
             filtered_episodes += 1
             continue
-        kept_episodes[eid] = erows
 
-    # Optional cap per qid, keeping top trajectory_score episodes.
+        kept_episodes[eid] = sorted_rows
+        episode_meta[eid] = {
+            "qid": str(terminal_row.get("qid", "unknown")),
+            "trajectory_score": float(terminal_row.get("trajectory_score", 0.0)),
+        }
+
     if args.max_traces_per_qid is not None:
         by_qid = defaultdict(list)
-        for eid, erows in kept_episodes.items():
-            qid = str(erows[0].get("qid", "unknown"))
-            score = float(erows[0].get("trajectory_score", 0.0))
-            by_qid[qid].append((score, eid))
+        for eid in kept_episodes:
+            by_qid[episode_meta[eid]["qid"]].append((episode_meta[eid]["trajectory_score"], eid))
 
         selected_eids = set()
-        for qid, arr in by_qid.items():
+        for _, arr in by_qid.items():
             arr.sort(reverse=True)
             for _, eid in arr[: max(1, args.max_traces_per_qid)]:
                 selected_eids.add(eid)
 
         kept_episodes = {eid: kept_episodes[eid] for eid in selected_eids}
+        episode_meta = {eid: episode_meta[eid] for eid in selected_eids}
 
-    # Episode-aware action filter.
     if args.min_action_count_for_keep is not None:
         global_hist = Counter(int(r.get("action", -1)) for er in kept_episodes.values() for r in er)
         allowed_actions = {a for a, c in global_hist.items() if a >= 0 and c >= args.min_action_count_for_keep}
@@ -102,17 +148,38 @@ def main() -> int:
             for eid, er in kept_episodes.items()
             if any(int(r.get("action", -1)) in allowed_actions for r in er)
         }
+        episode_meta = {eid: episode_meta[eid] for eid in kept_episodes}
 
-    qids = sorted({str(er[0].get("qid", "unknown")) for er in kept_episodes.values()})
+    qids = sorted({episode_meta[eid]["qid"] for eid in kept_episodes})
     train_qids, val_qids = split_qids(qids, args.val_ratio, args.seed)
 
     train_rows, val_rows = [], []
-    for _, erows in kept_episodes.items():
-        qid = str(erows[0].get("qid", "unknown"))
+    train_eps, val_eps = {}, {}
+    for eid, erows in kept_episodes.items():
+        qid = episode_meta[eid]["qid"]
         if qid in train_qids:
             train_rows.extend(erows)
+            train_eps[eid] = erows
         else:
             val_rows.extend(erows)
+            val_eps[eid] = erows
+
+    kept_raw_hist = _action_hist([r for er in kept_episodes.values() for r in er])
+    train_hist = _action_hist(train_rows)
+    val_hist = _action_hist(val_rows)
+    train_terminal_hist = _terminal_action_hist(train_eps)
+    val_terminal_hist = _terminal_action_hist(val_eps)
+    kept_terminal_hist = _terminal_action_hist(kept_episodes)
+
+    kept_actions = {int(a) for a in kept_raw_hist}
+    train_actions = {int(a) for a in train_hist}
+    disappeared_actions = sorted(kept_actions - train_actions)
+    if disappeared_actions:
+        print(
+            f"[prepare_traces][warn] actions present in kept episodes disappeared from train split: {disappeared_actions}",
+            flush=True,
+        )
+    _warn_terminal_action_disappearance(kept_terminal_hist, train_terminal_hist)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -127,8 +194,6 @@ def main() -> int:
         vals = [float(r.get(key, 0.0)) for r in rr if r.get("done", False)]
         return mean(vals) if vals else 0.0
 
-    train_hist = _action_hist(train_rows)
-    val_hist = _action_hist(val_rows)
     inv_weights = {}
     if args.emit_action_histogram and train_hist:
         for a, c in train_hist.items():
@@ -143,6 +208,7 @@ def main() -> int:
         "num_input_episodes": len(episodes),
         "num_filtered_episodes": filtered_episodes,
         "num_kept_episodes": len(kept_episodes),
+        "num_missing_terminal_rows": missing_terminal_warning_count,
         "train_rows": len(train_rows),
         "val_rows": len(val_rows),
         "train_qids": len({r['qid'] for r in train_rows}) if train_rows else 0,
@@ -151,10 +217,14 @@ def main() -> int:
         "val_avg_episode_reward": agg(val_rows, "episode_total_reward"),
         "train_success_rate": agg(train_rows, "success"),
         "val_success_rate": agg(val_rows, "success"),
+        "kept_raw_action_histogram": kept_raw_hist,
+        "kept_terminal_action_histogram": kept_terminal_hist,
+        "train_action_histogram": train_hist,
+        "val_action_histogram": val_hist,
+        "train_terminal_action_histogram": train_terminal_hist,
+        "val_terminal_action_histogram": val_terminal_hist,
     }
     if args.emit_action_histogram:
-        summary["train_action_histogram"] = train_hist
-        summary["val_action_histogram"] = val_hist
         summary["train_inverse_action_weights"] = inv_weights
 
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

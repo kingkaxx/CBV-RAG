@@ -15,7 +15,9 @@ def _validate_checkpoint_compat(ckpt: Dict[str, Any], cfg: Any) -> None:
     expected_act_dim = len(Action)
     if int(cfg.act_dim) != expected_act_dim:
         raise ValueError(
-            f"Policy checkpoint act_dim={cfg.act_dim} does not match Action enum size={expected_act_dim}."
+            "Policy checkpoint/action mismatch: "
+            f"checkpoint act_dim={cfg.act_dim}, runtime Action enum size={expected_act_dim}. "
+            "This usually means the checkpoint was trained with an older action set; re-run trace prep and training."
         )
 
     ckpt_schema = ckpt.get("feature_schema_version")
