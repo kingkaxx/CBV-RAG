@@ -79,6 +79,35 @@ def estimate_case_profile(state: Any) -> str:
     return "standard"
 
 
+def estimate_case_profile_from_example(ex: Dict[str, Any]) -> str:
+    question = (ex.get("question") or "").strip()
+    q_words = question.split()
+    q_len = len(q_words)
+    context_docs = ex.get("context") or []
+    n_ctx = len(context_docs) if isinstance(context_docs, list) else 0
+    support_titles = ex.get("support_titles") or []
+    n_support = len(support_titles) if isinstance(support_titles, list) else 0
+
+    cap_like = sum(1 for w in q_words if w[:1].isupper() and len(w) > 2)
+    q_lower = question.lower()
+    bridge_markers = ["before", "after", "first", "then", "whose", "which", "where", "when"]
+    comparison_markers = ["both", "same", "different", "compared", "versus", "or"]
+
+    has_bridge = any(m in q_lower for m in bridge_markers)
+    has_compare = any(m in q_lower for m in comparison_markers)
+    distractor_heavy = n_ctx >= 8 and n_support > 0 and n_ctx > max(2, n_support * 3)
+
+    if q_len <= 9 and cap_like <= 2 and n_ctx <= 3 and not has_bridge and not has_compare:
+        return "easy"
+    if distractor_heavy or n_ctx >= 14:
+        return "overloaded"
+    if q_len >= 18 or cap_like >= 5 or (has_bridge and has_compare):
+        return "hard"
+    if has_bridge or has_compare or n_support >= 2 or n_ctx >= 6:
+        return "ambiguous"
+    return "standard"
+
+
 class OracleControllerBase:
     oracle_name = "base"
 
@@ -211,7 +240,7 @@ def sample_oracle_name(case_profile: str, oracle_mix: Dict[str, float], rng: ran
         adjusted["efficient"] = adjusted.get("efficient", 0.0) + 0.2
     elif case_profile == "ambiguous":
         adjusted["exploratory"] = adjusted.get("exploratory", 0.0) + 0.25
-    elif case_profile == "hard_overloaded":
+    elif case_profile in {"hard_overloaded", "hard", "overloaded"}:
         adjusted["deliberative"] = adjusted.get("deliberative", 0.0) + 0.25
 
     names = [k for k in adjusted.keys() if k in ORACLE_REGISTRY and adjusted[k] > 0]

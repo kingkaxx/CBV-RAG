@@ -11,6 +11,7 @@ import torch
 
 import config
 import model_loader
+from cbvrag.actions import Action
 from cbvrag.controller_heuristic import HeuristicController
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
@@ -20,7 +21,7 @@ from rl.trace_oracles import (
     TrajectoryScoreConfig,
     build_oracle_controller,
     compute_episode_quality,
-    estimate_case_profile,
+    estimate_case_profile_from_example,
     parse_oracle_mix,
     sample_oracle_name,
     score_trajectory,
@@ -48,6 +49,78 @@ def resolve_llm_device(requested: str | None) -> str:
 
 def fmt_ratio(num: float, den: float) -> float:
     return num / den if den else 0.0
+
+
+def _action_sequence(log: Dict) -> List[int]:
+    return [int(s.get("action")) for s in log.get("steps", []) if isinstance(s, dict) and s.get("action") is not None]
+
+
+def _explicit_early_stop(log: Dict) -> bool:
+    steps = log.get("steps", [])
+    if not steps:
+        return False
+    budgets = (log.get("state") or {}).get("budgets", {})
+    max_steps = int(budgets.get("max_steps", len(steps)))
+    last = steps[-1]
+    action_name = str(last.get("action_name", ""))
+    action_idx = int(last.get("action", -1)) if last.get("action") is not None else -1
+    explicit_terminate = action_name in {"STOP_AND_ANSWER", "ANSWER_DIRECT"} or action_idx in {
+        int(Action.STOP_AND_ANSWER),
+        int(Action.ANSWER_DIRECT),
+    }
+    return explicit_terminate and len(steps) < max_steps
+
+
+def _behavior_signature(cand: Dict) -> str:
+    return "|".join(
+        [
+            f"s{cand['steps']}",
+            f"r{cand['retrieval_calls']}",
+            f"b{cand['num_branches']}",
+            ",".join(map(str, cand.get("action_sequence", []))),
+        ]
+    )
+
+
+def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success: bool) -> List[Dict]:
+    if not cands:
+        return []
+
+    successful = [c for c in cands if c.get("success")]
+    near = [c for c in cands if c.get("f1", 0.0) >= 0.5 or c.get("em", 0.0) >= 1.0]
+    pool = successful or (near if allow_near_success else cands)
+    if not pool:
+        pool = cands
+
+    sorted_by_score = sorted(pool, key=lambda c: (c["trajectory_score"], c["f1"], -c["tokens"]), reverse=True)
+    sorted_by_short = sorted(pool, key=lambda c: (c["steps"], c["tokens"], -c["trajectory_score"]))
+    sorted_by_branch = sorted(pool, key=lambda c: (c["num_branches"], c["trajectory_score"]), reverse=True)
+
+    best = sorted_by_score[0]
+    shortest = sorted_by_short[0]
+    chosen: List[Dict] = []
+
+    if keep_n <= 1:
+        close_in_score = (best["trajectory_score"] - shortest["trajectory_score"]) <= 0.4
+        chosen = [shortest if close_in_score else best]
+    else:
+        chosen.append(shortest)
+        if _behavior_signature(best) != _behavior_signature(shortest):
+            chosen.append(best)
+        if keep_n >= 3:
+            for c in sorted_by_branch:
+                if c["num_branches"] <= 1:
+                    continue
+                if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
+                    chosen.append(c)
+                    break
+        for c in sorted_by_score:
+            if len(chosen) >= keep_n:
+                break
+            if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
+                chosen.append(c)
+
+    return chosen[: max(1, keep_n)]
 
 
 def main() -> int:
@@ -147,6 +220,7 @@ def main() -> int:
                 tools["retrieve"] = RetrieverTool(retriever)
 
             num_candidates = 1 if args.trace_policy == "heuristic" else max(1, args.num_candidates_per_example)
+            case_profile = estimate_case_profile_from_example(ex) if args.trace_policy == "mixture" else "standard"
             candidate_infos = []
 
             for cand_idx in range(num_candidates):
@@ -155,21 +229,7 @@ def main() -> int:
                 if args.trace_policy == "heuristic":
                     controller = HeuristicController()
                     oracle_name = "heuristic"
-                    case_profile = "standard"
                 else:
-                    case_profile = estimate_case_profile(
-                        type(
-                            "S",
-                            (),
-                            {
-                                "metrics": {"retrieval_calls": 0},
-                                "branches": {"b0": object()},
-                                "selected_evidence_ids": [],
-                                "evidence_pool": {},
-                                "budgets": {"max_branches": 3, "max_retrieval_calls": 5},
-                            },
-                        )
-                    )
                     oracle_name = sample_oracle_name(case_profile, oracle_mix, rng)
                     controller = build_oracle_controller(oracle_name, seed=args.seed + i * 97 + cand_idx)
 
@@ -183,7 +243,9 @@ def main() -> int:
                 llm_calls = int(state_metrics.get("llm_calls", 0))
                 episode_steps = len(controller.trace)
                 num_branches = len(log.get("state", {}).get("branches", {}))
-                early_stop = episode_steps < log.get("state", {}).get("budgets", {}).get("max_steps", episode_steps)
+
+                action_sequence = _action_sequence(log)
+                explicit_early_stop = _explicit_early_stop(log)
 
                 golds = ex.get("answer") or [""]
                 em, f1, success = compute_episode_quality(pred, golds)
@@ -201,7 +263,7 @@ def main() -> int:
                     retrieval_calls=retrieval_calls,
                     branches_created=max(0, num_branches - 1),
                     verify_calls=verify_calls,
-                    early_stop=early_stop,
+                    early_stop=explicit_early_stop,
                     cfg=reward_cfg,
                 )
                 episode_total_reward = rewards["total"]
@@ -218,6 +280,12 @@ def main() -> int:
                     cfg=score_cfg,
                 )
 
+                # stronger preference for efficient successful traces with nontrivial but not excessive branching
+                if success:
+                    trajectory_score += 0.25 * (1.0 if explicit_early_stop else 0.0)
+                trajectory_score -= 0.04 * max(0, episode_steps - 5)
+                trajectory_score -= 0.06 * max(0, num_branches - 2)
+
                 candidate_infos.append(
                     {
                         "cand_idx": cand_idx,
@@ -230,7 +298,7 @@ def main() -> int:
                         "llm_calls": llm_calls,
                         "steps": episode_steps,
                         "num_branches": num_branches,
-                        "early_stop": early_stop,
+                        "explicit_early_stop": explicit_early_stop,
                         "success": bool(success),
                         "em": float(em),
                         "f1": float(f1),
@@ -241,22 +309,15 @@ def main() -> int:
                         "oracle_name": oracle_name,
                         "case_profile": case_profile,
                         "fallback_stop_was_used": bool(log.get("fallback_stop_was_used", False)),
+                        "action_sequence": action_sequence,
                     }
                 )
 
-            candidate_infos.sort(
-                key=lambda c: (
-                    1 if c["success"] else 0,
-                    c["trajectory_score"],
-                    c["f1"],
-                    -c["tokens"],
-                ),
-                reverse=True,
+            kept = _pick_diverse_candidates(
+                candidate_infos,
+                keep_n=max(1, args.keep_top_n_per_example),
+                allow_near_success=bool(args.allow_near_success),
             )
-
-            kept = candidate_infos[: max(1, args.keep_top_n_per_example)]
-            if args.allow_near_success and not any(c["success"] for c in kept):
-                kept = candidate_infos[: max(1, args.keep_top_n_per_example)]
 
             for rank, cand in enumerate(kept, start=1):
                 if args.keep_only_successful and not cand["success"]:
@@ -298,6 +359,8 @@ def main() -> int:
                         "episode_total_llm_calls": cand["llm_calls"],
                         "episode_num_branches": cand["num_branches"],
                         "episode_final_fallback_stop": cand["fallback_stop_was_used"],
+                        "explicit_early_stop": cand["explicit_early_stop"],
+                        "action_sequence": cand["action_sequence"],
                         # richer optional schema
                         "oracle_name": cand["oracle_name"],
                         "case_profile": cand["case_profile"],
@@ -314,6 +377,10 @@ def main() -> int:
                         "was_successful": bool(cand["success"]),
                         "final_em": cand["em"],
                         "final_f1": cand["f1"],
+                        "steps": cand["steps"],
+                        "retrieval_calls": cand["retrieval_calls"],
+                        "num_branches": cand["num_branches"],
+                        "verify_calls": cand["verify_calls"],
                     }
                     f.write(json.dumps(row) + "\n")
                     rows_written += 1

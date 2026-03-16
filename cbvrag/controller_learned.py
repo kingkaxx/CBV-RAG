@@ -23,6 +23,7 @@ class LearnedController:
                 f"Policy checkpoint act_dim={cfg.act_dim} does not match Action enum size={expected_act_dim}."
             )
         self.history_len = max(1, cfg.history_len)
+        self.expected_obs_dim = int(cfg.obs_dim)
         self._debug_print_limit = 8
         self._history: deque[list[float]] = deque(maxlen=self.history_len)
         self.model = build_policy(cfg)
@@ -35,6 +36,10 @@ class LearnedController:
 
     def _build_model_input(self, obs: Iterable[float]) -> torch.Tensor:
         obs_list = list(obs)
+        if len(obs_list) < self.expected_obs_dim:
+            obs_list = obs_list + [0.0] * (self.expected_obs_dim - len(obs_list))
+        elif len(obs_list) > self.expected_obs_dim:
+            obs_list = obs_list[: self.expected_obs_dim]
         self._history.append(obs_list)
         if len(self._history) < self.history_len:
             while len(self._history) < self.history_len:
