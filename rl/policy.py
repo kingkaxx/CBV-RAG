@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from torch import nn
@@ -54,7 +54,9 @@ class MLPResidualPolicy(nn.Module):
     def __init__(self, cfg: PolicyConfig):
         super().__init__()
         self.input = nn.Linear(cfg.obs_dim, cfg.hidden_dim)
-        self.blocks = nn.ModuleList([ResidualBlock(cfg.hidden_dim, cfg.dropout) for _ in range(max(1, cfg.num_layers))])
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(cfg.hidden_dim, cfg.dropout) for _ in range(max(1, cfg.num_layers))]
+        )
         self.head = nn.Linear(cfg.hidden_dim, cfg.act_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -65,6 +67,15 @@ class MLPResidualPolicy(nn.Module):
 
 
 class GRUPolicy(nn.Module):
+    """
+    Expects either:
+      - [B, obs_dim] for one-step inputs
+      - [B, T, obs_dim] for real history windows
+
+    Important: do NOT fake history by repeating the same observation. That made the
+    old GRU behave like a costlier MLP while giving a false impression of sequence learning.
+    """
+
     def __init__(self, cfg: PolicyConfig):
         super().__init__()
         self.obs_dim = cfg.obs_dim
@@ -80,9 +91,11 @@ class GRUPolicy(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
-            seq = x.unsqueeze(1).repeat(1, self.history_len, 1)
-        else:
+            seq = x.unsqueeze(1)
+        elif x.dim() == 3:
             seq = x
+        else:
+            raise ValueError(f"GRUPolicy expects 2D or 3D input, got shape={tuple(x.shape)}")
         out, _ = self.gru(seq)
         return self.head(out[:, -1, :])
 
@@ -95,6 +108,19 @@ def build_policy(cfg: PolicyConfig) -> nn.Module:
     if cfg.policy_type == "gru_policy":
         return GRUPolicy(cfg)
     raise ValueError(f"Unsupported policy_type={cfg.policy_type}")
+
+
+def masked_logits(logits: torch.Tensor, action_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    if action_mask is None:
+        return logits
+    if action_mask.dtype != torch.bool:
+        action_mask = action_mask.bool()
+    masked = logits.masked_fill(~action_mask, float("-inf"))
+    # Fallback: if an entire row is masked, revert that row to original logits.
+    all_bad = (~action_mask).all(dim=-1)
+    if all_bad.any():
+        masked[all_bad] = logits[all_bad]
+    return masked
 
 
 def policy_config_from_checkpoint(ckpt: Dict[str, Any]) -> PolicyConfig:

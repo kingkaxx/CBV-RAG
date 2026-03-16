@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from cbvrag.actions import Action
 from cbvrag.features import build_features
@@ -41,8 +41,125 @@ def _make_state(question: str, qid: str, budgets: Dict) -> EpisodeState:
             "branch_count_changed": 0,
             "verification_status_changed": 0,
             "previous_selected_count": 0,
+            "fallback_stop_was_used": 0,
+            "explicit_stop_used": 0,
+            "forced_stop_used": 0,
+            "explicit_terminal_action": -1,
+            "illegal_action_requested": 0,
+            "forced_action_count": 0,
         },
     )
+
+
+def _selected_snippets(state: EpisodeState, max_items: int | None = None) -> List[str]:
+    ids = state.selected_evidence_ids if max_items is None else state.selected_evidence_ids[:max_items]
+    return [state.evidence_pool[eid].short_claim for eid in ids if eid in state.evidence_pool]
+
+
+def _can_stop_now(state: EpisodeState) -> bool:
+    retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
+    selected_nonempty = len(state.selected_evidence_ids) > 0
+    return selected_nonempty and (retrieval_calls >= 2 or state.verification_status == "supported")
+
+
+def compute_action_mask(state: EpisodeState) -> List[bool]:
+    action_mask = [True] * len(Action)
+
+    last_action = int(state.metrics.get("last_action", -1))
+    second_last_action = int(state.metrics.get("second_last_action", -1))
+    no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
+    selected_changed = int(state.metrics.get("selected_evidence_changed", 1))
+    pool_changed = int(state.metrics.get("evidence_pool_changed", 1))
+    retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
+
+    selected_nonempty = len(state.selected_evidence_ids) > 0
+    pool_nonempty = len(state.evidence_pool) > 0
+    branches_open = len(state.branches) < state.budgets["max_branches"]
+    branches_prunable = len(state.branches) > 1
+
+    if not pool_nonempty:
+        action_mask[int(Action.SELECT_CONTEXT)] = False
+        action_mask[int(Action.VERIFY_CHEAP)] = False
+    if not selected_nonempty:
+        action_mask[int(Action.VERIFY_LLM)] = False
+        action_mask[int(Action.SUMMARIZE_STATE)] = False
+
+    if last_action == int(Action.SELECT_CONTEXT) and selected_changed == 0:
+        action_mask[int(Action.SELECT_CONTEXT)] = False
+    if last_action == int(Action.SELECT_CONTEXT) and no_progress_streak >= 1:
+        action_mask[int(Action.SELECT_CONTEXT)] = False
+    if selected_nonempty and pool_changed == 0 and selected_changed == 0:
+        action_mask[int(Action.SELECT_CONTEXT)] = False
+
+    no_op_repeat_actions = {
+        int(Action.SELECT_CONTEXT),
+        int(Action.SUMMARIZE_STATE),
+        int(Action.MERGE_BRANCHES),
+        int(Action.PRUNE_BRANCH),
+    }
+    if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
+        action_mask[last_action] = False
+
+    if not branches_open:
+        action_mask[int(Action.SPAWN_COUNTERFACTUAL)] = False
+    if not branches_prunable:
+        action_mask[int(Action.PRUNE_BRANCH)] = False
+        action_mask[int(Action.MERGE_BRANCHES)] = False
+
+    if retrieval_calls >= state.budgets["max_retrieval_calls"]:
+        action_mask[int(Action.RETRIEVE_MORE_SMALL)] = False
+        action_mask[int(Action.RETRIEVE_MORE_LARGE)] = False
+
+    can_stop_now = _can_stop_now(state)
+    action_mask[int(Action.STOP_AND_ANSWER)] = can_stop_now
+    action_mask[int(Action.ANSWER_DIRECT)] = can_stop_now
+
+    if not any(action_mask):
+        action_mask[int(Action.STOP_AND_ANSWER)] = True
+    return action_mask
+
+
+def choose_valid_action(
+    proposed_action_idx: int,
+    state: EpisodeState,
+    action_mask: List[bool],
+) -> tuple[Action, bool, int]:
+    """
+    Returns:
+      - resolved action
+      - whether action was forced / replaced
+      - original requested action idx
+    """
+    requested = int(proposed_action_idx)
+    action = Action(requested)
+    action_was_forced = False
+
+    if action_mask[int(action)]:
+        return action, action_was_forced, requested
+
+    action_was_forced = True
+    state.metrics["illegal_action_requested"] = int(state.metrics.get("illegal_action_requested", 0)) + 1
+    state.metrics["forced_action_count"] = int(state.metrics.get("forced_action_count", 0)) + 1
+
+    selected_nonempty = len(state.selected_evidence_ids) > 0
+    pool_nonempty = len(state.evidence_pool) > 0
+    retrieval_calls_now = int(state.metrics.get("retrieval_calls", 0))
+
+    if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_SMALL)]:
+        return Action.RETRIEVE_MORE_SMALL, True, requested
+    if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_LARGE)]:
+        return Action.RETRIEVE_MORE_LARGE, True, requested
+    if action_mask[int(Action.VERIFY_CHEAP)] and pool_nonempty:
+        return Action.VERIFY_CHEAP, True, requested
+    if action_mask[int(Action.SELECT_CONTEXT)] and pool_nonempty:
+        return Action.SELECT_CONTEXT, True, requested
+    if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
+        return Action.STOP_AND_ANSWER, True, requested
+    if action_mask[int(Action.ANSWER_DIRECT)] and selected_nonempty:
+        return Action.ANSWER_DIRECT, True, requested
+
+    fallback_idx = next(i for i, ok in enumerate(action_mask) if ok)
+    return Action(fallback_idx), True, requested
 
 
 def execute_action(state: EpisodeState, action: Action, controller: Any, tools: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,7 +229,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
 
     elif action == Action.VERIFY_LLM:
         state.metrics["verify_calls"] += 1
-        snippets = [state.evidence_pool[eid].short_claim for eid in state.selected_evidence_ids[:3] if eid in state.evidence_pool]
+        snippets = _selected_snippets(state, max_items=3)
         claim = state.branches[state.active_branch_id].hypothesis or "candidate answer"
         prompt = verify_prompt(state.question, claim, snippets)
         verdict, usage = llm.generate(prompt, max_new_tokens=8, temperature=0.0, name="verify")
@@ -127,26 +244,34 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
             state.verification_status = "unknown"
 
     elif action == Action.SUMMARIZE_STATE:
-        snippets = [state.evidence_pool[eid].short_claim for eid in state.selected_evidence_ids[:3] if eid in state.evidence_pool]
+        snippets = _selected_snippets(state, max_items=3)
         prompt = "Summarize the current evidence in <=80 words:\n" + "\n".join(snippets)
         summary, usage = llm.generate(prompt, max_new_tokens=80, temperature=0.0, name="summarize")
         state.metrics["llm_calls"] += 1
         step_costs["tokens_used_this_step"] += usage["total_tokens"]
         state.global_summary = summary[:1000]
+        try:
+            state.branches[state.active_branch_id].summary = summary[:1000]
+        except Exception:
+            pass
 
     elif action in (Action.ANSWER_DIRECT, Action.STOP_AND_ANSWER):
-        snippets = [state.evidence_pool[eid].short_claim for eid in state.selected_evidence_ids if eid in state.evidence_pool]
-        prompt = answer_prompt(state.question, snippets, state.branches[state.active_branch_id].summary, state.global_summary)
+        snippets = _selected_snippets(state)
+        branch_summary = getattr(state.branches[state.active_branch_id], "summary", "")
+        prompt = answer_prompt(state.question, snippets, branch_summary, state.global_summary)
         answer, usage = llm.generate(prompt, max_new_tokens=96, temperature=0.0, name="answer")
         state.metrics["llm_calls"] += 1
         step_costs["tokens_used_this_step"] += usage["total_tokens"]
         state.final_answer = answer
 
     elif action == Action.PRUNE_BRANCH and len(state.branches) > 1:
-        for bid in list(state.branches.keys()):
-            if bid != state.active_branch_id:
-                state.branches[bid].status = "pruned"
+        victim = None
+        for bid, branch in state.branches.items():
+            if bid != state.active_branch_id and getattr(branch, "status", "active") != "pruned":
+                victim = bid
                 break
+        if victim is not None:
+            state.branches[victim].status = "pruned"
 
     elif action == Action.MERGE_BRANCHES:
         state.global_summary = (state.global_summary + " merged").strip()
@@ -178,6 +303,9 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         branch_count_changed: int,
         verification_status_changed: int,
         made_progress: bool,
+        requested_action: int | None = None,
+        action_was_forced: bool = False,
+        action_mask: List[bool] | None = None,
     ) -> None:
         state.metrics["second_last_action"] = int(state.metrics.get("last_action", -1))
         state.metrics["last_action"] = int(action)
@@ -192,6 +320,9 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 "step": state.step,
                 "action": int(action),
                 "action_name": action.name,
+                "requested_action": int(requested_action) if requested_action is not None else int(action),
+                "action_was_forced": bool(action_was_forced),
+                "action_mask": list(action_mask) if action_mask is not None else None,
                 "costs": costs,
                 "metrics": dict(state.metrics),
                 "selected_evidence_changed": selected_evidence_changed,
@@ -241,6 +372,9 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             branch_count_changed,
             verification_status_changed,
             made_progress,
+            requested_action=int(Action.STOP_AND_ANSWER),
+            action_was_forced=True,
+            action_mask=[True] * len(Action),
         )
 
         fallback_stop_was_used = True
@@ -248,75 +382,21 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
 
     for _ in range(budgets["max_steps"]):
         obs = build_features(state)
-
-        action_mask = [True] * len(Action)
-        last_action = int(state.metrics.get("last_action", -1))
-        second_last_action = int(state.metrics.get("second_last_action", -1))
-        no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
-        selected_changed = int(state.metrics.get("selected_evidence_changed", 1))
-        pool_changed = int(state.metrics.get("evidence_pool_changed", 1))
-        retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
-        selected_nonempty = len(state.selected_evidence_ids) > 0
-        pool_nonempty = len(state.evidence_pool) > 0
-
-        if not pool_nonempty:
-            action_mask[int(Action.SELECT_CONTEXT)] = False
-        if last_action == int(Action.SELECT_CONTEXT) and selected_changed == 0:
-            action_mask[int(Action.SELECT_CONTEXT)] = False
-        if last_action == int(Action.SELECT_CONTEXT) and no_progress_streak >= 1:
-            action_mask[int(Action.SELECT_CONTEXT)] = False
-        if selected_nonempty and pool_changed == 0 and selected_changed == 0:
-            action_mask[int(Action.SELECT_CONTEXT)] = False
-
-        no_op_repeat_actions = {
-            int(Action.SELECT_CONTEXT),
-            int(Action.SUMMARIZE_STATE),
-            int(Action.MERGE_BRANCHES),
-            int(Action.PRUNE_BRANCH),
-        }
-        if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
-            action_mask[last_action] = False
-
-        # Only allow terminal actions after stronger evidence of readiness:
-        # either we have retrieved at least twice, or verification already supports stopping.
-        can_stop_now = selected_nonempty and (
-            retrieval_calls >= 2 or state.verification_status == "supported"
-        )
-        action_mask[int(Action.STOP_AND_ANSWER)] = can_stop_now
-        action_mask[int(Action.ANSWER_DIRECT)] = can_stop_now
+        action_mask = compute_action_mask(state)
 
         try:
             action_idx = controller.act(obs, state, action_mask=action_mask)
         except TypeError:
             action_idx = controller.act(obs, state)
 
-        controller_action = Action(action_idx)
-        action = controller_action
-        action_was_forced = False
-
-        if not action_mask[int(action)]:
-            action_was_forced = True
-            selected_nonempty = len(state.selected_evidence_ids) > 0
-            pool_nonempty = len(state.evidence_pool) > 0
-            retrieval_calls_now = int(state.metrics.get("retrieval_calls", 0))
-
-            # Prefer deeper retrieval before stopping when we only retrieved once.
-            if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_SMALL)]:
-                action = Action.RETRIEVE_MORE_SMALL
-            elif retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_LARGE)]:
-                action = Action.RETRIEVE_MORE_LARGE
-            elif action_mask[int(Action.VERIFY_CHEAP)] and pool_nonempty:
-                action = Action.VERIFY_CHEAP
-            elif action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
-                action = Action.STOP_AND_ANSWER
-            elif action_mask[int(Action.ANSWER_DIRECT)] and selected_nonempty:
-                action = Action.ANSWER_DIRECT
-            else:
-                action = Action(next(i for i, ok in enumerate(action_mask) if ok))
+        action, action_was_forced, requested_action = choose_valid_action(action_idx, state, action_mask)
 
         if _should_debug(state.qid):
             print(
-                f"[run_episode][debug] qid={state.qid} step={state.step} action_idx={action_idx} action={action.name} no_progress={no_progress_streak} selected_nonempty={len(state.selected_evidence_ids)>0}",
+                f"[run_episode][debug] qid={state.qid} step={state.step} "
+                f"requested={requested_action} resolved={action.name} forced={action_was_forced} "
+                f"no_progress={int(state.metrics.get('no_progress_streak', 0))} "
+                f"selected_nonempty={len(state.selected_evidence_ids) > 0}",
                 flush=True,
             )
 
@@ -331,6 +411,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             )
         ):
             action = Action.VERIFY_CHEAP
+            action_was_forced = True
 
         before_selected = set(state.selected_evidence_ids)
         before_pool = len(state.evidence_pool)
@@ -370,6 +451,9 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             branch_count_changed,
             verification_status_changed,
             made_progress,
+            requested_action=requested_action,
+            action_was_forced=action_was_forced,
+            action_mask=action_mask,
         )
 
         if (
