@@ -28,7 +28,20 @@ def _make_state(question: str, qid: str, budgets: Dict) -> EpisodeState:
         branches={"b0": root},
         active_branch_id="b0",
         budgets=budgets,
-        metrics={"retrieval_calls": 0, "rerank_calls": 0, "verify_calls": 0, "llm_calls": 0, "last_action": -1, "second_last_action": -1, "no_progress_streak": 0, "selected_evidence_changed": 0, "evidence_pool_changed": 0, "branch_count_changed": 0, "verification_status_changed": 0, "previous_selected_count": 0},
+        metrics={
+            "retrieval_calls": 0,
+            "rerank_calls": 0,
+            "verify_calls": 0,
+            "llm_calls": 0,
+            "last_action": -1,
+            "second_last_action": -1,
+            "no_progress_streak": 0,
+            "selected_evidence_changed": 0,
+            "evidence_pool_changed": 0,
+            "branch_count_changed": 0,
+            "verification_status_changed": 0,
+            "previous_selected_count": 0,
+        },
     )
 
 
@@ -157,10 +170,79 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         except Exception:
             return False
 
+    def _append_log(action: Action, costs: Dict[str, Any], selected_evidence_changed: int,
+                    evidence_pool_changed: int, branch_count_changed: int,
+                    verification_status_changed: int, made_progress: bool) -> None:
+        state.metrics["second_last_action"] = int(state.metrics.get("last_action", -1))
+        state.metrics["last_action"] = int(action)
+        state.metrics["selected_evidence_changed"] = selected_evidence_changed
+        state.metrics["evidence_pool_changed"] = evidence_pool_changed
+        state.metrics["branch_count_changed"] = branch_count_changed
+        state.metrics["verification_status_changed"] = verification_status_changed
+        state.metrics["no_progress_streak"] = 0 if made_progress else int(state.metrics.get("no_progress_streak", 0)) + 1
+
+        logs.append(
+            {
+                "step": state.step,
+                "action": int(action),
+                "action_name": action.name,
+                "costs": costs,
+                "metrics": dict(state.metrics),
+                "selected_evidence_changed": selected_evidence_changed,
+                "evidence_pool_changed": evidence_pool_changed,
+                "branch_count_changed": branch_count_changed,
+                "verification_status_changed": verification_status_changed,
+                "no_progress_streak": int(state.metrics.get("no_progress_streak", 0)),
+            }
+        )
+
+    def _force_terminal_stop() -> None:
+        nonlocal fallback_stop_was_used, forced_stop_used
+
+        before_selected = set(state.selected_evidence_ids)
+        before_pool = len(state.evidence_pool)
+        before_branches = len(state.branches)
+        before_ver_status = state.verification_status
+        before_final = bool((state.final_answer or "").strip())
+
+        costs = execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
+
+        after_selected = set(state.selected_evidence_ids)
+        after_pool = len(state.evidence_pool)
+        after_branches = len(state.branches)
+        after_ver_status = state.verification_status
+        after_final = bool((state.final_answer or "").strip())
+
+        selected_evidence_changed = int(after_selected != before_selected)
+        evidence_pool_changed = int(after_pool != before_pool)
+        branch_count_changed = int(after_branches != before_branches)
+        verification_status_changed = int(after_ver_status != before_ver_status)
+        made_progress = any(
+            [
+                selected_evidence_changed,
+                evidence_pool_changed,
+                branch_count_changed,
+                verification_status_changed,
+                after_final != before_final,
+            ]
+        )
+
+        _append_log(
+            Action.STOP_AND_ANSWER,
+            costs,
+            selected_evidence_changed,
+            evidence_pool_changed,
+            branch_count_changed,
+            verification_status_changed,
+            made_progress,
+        )
+
+        fallback_stop_was_used = True
+        forced_stop_used = True
+
     for _ in range(budgets["max_steps"]):
         obs = build_features(state)
 
-        # Build an action mask to avoid no-progress loops.
         action_mask = [True] * len(Action)
         last_action = int(state.metrics.get("last_action", -1))
         second_last_action = int(state.metrics.get("second_last_action", -1))
@@ -171,7 +253,6 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         selected_nonempty = len(state.selected_evidence_ids) > 0
         pool_nonempty = len(state.evidence_pool) > 0
 
-        # Stronger SELECT_CONTEXT masking in no-progress cases.
         if not pool_nonempty:
             action_mask[int(Action.SELECT_CONTEXT)] = False
         if last_action == int(Action.SELECT_CONTEXT) and selected_changed == 0:
@@ -181,13 +262,16 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         if selected_nonempty and pool_changed == 0 and selected_changed == 0:
             action_mask[int(Action.SELECT_CONTEXT)] = False
 
-        # Direct anti-repeat for non-terminal no-op prone actions.
-        no_op_repeat_actions = {int(Action.SELECT_CONTEXT), int(Action.SUMMARIZE_STATE), int(Action.MERGE_BRANCHES), int(Action.PRUNE_BRANCH)}
+        no_op_repeat_actions = {
+            int(Action.SELECT_CONTEXT),
+            int(Action.SUMMARIZE_STATE),
+            int(Action.MERGE_BRANCHES),
+            int(Action.PRUNE_BRANCH),
+        }
         if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
             action_mask[last_action] = False
 
         if retrieval_calls > 0 and selected_nonempty:
-            # Keep terminating actions valid once we have some evidence.
             action_mask[int(Action.STOP_AND_ANSWER)] = True
             action_mask[int(Action.ANSWER_DIRECT)] = True
 
@@ -195,12 +279,12 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             action_idx = controller.act(obs, state, action_mask=action_mask)
         except TypeError:
             action_idx = controller.act(obs, state)
+
         controller_action = Action(action_idx)
         action = controller_action
         action_was_forced = False
 
         if not action_mask[int(action)]:
-            # If controller picked masked action, force a safe fallback with termination preference.
             action_was_forced = True
             selected_nonempty = len(state.selected_evidence_ids) > 0
             if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
@@ -218,8 +302,6 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 flush=True,
             )
 
-        # Early-stop safeguard: when controller tries to stop while still uncertain,
-        # run one cheap verification first if there is remaining budget.
         if (
             action == Action.STOP_AND_ANSWER
             and state.verification_status == "unknown"
@@ -250,30 +332,26 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         evidence_pool_changed = int(after_pool != before_pool)
         branch_count_changed = int(after_branches != before_branches)
         verification_status_changed = int(after_ver_status != before_ver_status)
-        made_progress = any([selected_evidence_changed, evidence_pool_changed, branch_count_changed, verification_status_changed, after_final != before_final])
+        made_progress = any(
+            [
+                selected_evidence_changed,
+                evidence_pool_changed,
+                branch_count_changed,
+                verification_status_changed,
+                after_final != before_final,
+            ]
+        )
 
-        state.metrics["second_last_action"] = int(state.metrics.get("last_action", -1))
-        state.metrics["last_action"] = int(action)
         state.metrics["previous_selected_count"] = len(before_selected)
-        state.metrics["selected_evidence_changed"] = selected_evidence_changed
-        state.metrics["evidence_pool_changed"] = evidence_pool_changed
-        state.metrics["branch_count_changed"] = branch_count_changed
-        state.metrics["verification_status_changed"] = verification_status_changed
-        state.metrics["no_progress_streak"] = 0 if made_progress else int(state.metrics.get("no_progress_streak", 0)) + 1
 
-        logs.append(
-            {
-                "step": state.step,
-                "action": int(action),
-                "action_name": action.name,
-                "costs": costs,
-                "metrics": dict(state.metrics),
-                "selected_evidence_changed": selected_evidence_changed,
-                "evidence_pool_changed": evidence_pool_changed,
-                "branch_count_changed": branch_count_changed,
-                "verification_status_changed": verification_status_changed,
-                "no_progress_streak": int(state.metrics.get("no_progress_streak", 0)),
-            }
+        _append_log(
+            action,
+            costs,
+            selected_evidence_changed,
+            evidence_pool_changed,
+            branch_count_changed,
+            verification_status_changed,
+            made_progress,
         )
 
         if (
@@ -286,10 +364,9 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 else:
                     explicit_stop_used = True
                 explicit_terminal_action = int(action)
+
             if not state.final_answer:
-                execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
-                fallback_stop_was_used = True
-                forced_stop_used = True
+                _force_terminal_stop()
             break
 
         if (
@@ -298,16 +375,11 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             and len(state.selected_evidence_ids) > 0
             and state.step < budgets["max_steps"]
         ):
-            execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
-            fallback_stop_was_used = True
-            forced_stop_used = True
+            _force_terminal_stop()
             break
 
-    # Always force a final answer if rollout exhausted max_steps without explicit answer.
     if not state.final_answer:
-        execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
-        fallback_stop_was_used = True
-        forced_stop_used = True
+        _force_terminal_stop()
 
     out = {
         "state": asdict(state),
