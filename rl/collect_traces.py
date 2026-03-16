@@ -79,14 +79,8 @@ def _has_explicit_stop_flag(log: Dict) -> bool:
 
 
 def _is_explicit_terminal(log: Dict, action_sequence: List[int]) -> bool:
-    """
-    Robust terminal check:
-    1. Prefer action-based classification.
-    2. Fall back to explicit_stop_used for older/newer log variants.
-    """
-    if action_sequence:
-        if _is_explicit_terminal_action(action_sequence[-1]):
-            return True
+    if action_sequence and _is_explicit_terminal_action(action_sequence[-1]):
+        return True
     return _has_explicit_stop_flag(log)
 
 
@@ -159,6 +153,25 @@ def _pick_shortest_successful_terminal(pool: List[Dict], action: Action) -> Dict
     )
 
 
+def _pick_best_multi_retrieval_success(pool: List[Dict], min_retrievals: int = 2) -> Dict | None:
+    matches = [
+        c
+        for c in pool
+        if c.get("success", False) and int(c.get("retrieval_calls", 0)) >= min_retrievals
+    ]
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda c: (
+            c.get("trajectory_score", 0.0),
+            c.get("f1", 0.0),
+            c.get("retrieval_calls", 0),
+            -c.get("tokens", 10**9),
+        ),
+    )
+
+
 def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success: bool) -> List[Dict]:
     if not cands:
         return []
@@ -208,6 +221,10 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
         _add_if_new(preferred)
     else:
         _add_if_new(stop_shortest or answer_direct_shortest)
+
+    # Preserve at least one successful deeper-retrieval trajectory when available.
+    multi_retrieval = _pick_best_multi_retrieval_success(pool, min_retrievals=2)
+    _add_if_new(multi_retrieval)
 
     if keep_n <= 1:
         if chosen:
@@ -331,7 +348,9 @@ def main() -> int:
             context_docs = ex.get("context") if isinstance(ex, dict) else None
             if context_docs:
                 retriever.build_temp_index_from_docs(context_docs)
-                tools["retrieve"] = RetrieverTool(retriever, cache_dir=f"./cache/retrieval/{args.dataset}/{qid}")
+                tools["retrieve"] = RetrieverTool(
+                    retriever, cache_dir=f"./cache/retrieval/{args.dataset}/{qid}"
+                )
             else:
                 retriever.clear_temp_index()
                 tools["retrieve"] = RetrieverTool(retriever)
@@ -421,8 +440,8 @@ def main() -> int:
 
                 trajectory_score -= 0.04 * max(0, verify_steps - 1)
                 trajectory_score -= 0.12 * float(verify_no_improvement)
-                trajectory_score -= 0.04 * max(0, episode_steps - 5)
-                trajectory_score -= 0.06 * max(0, num_branches - 2)
+                trajectory_score -= 0.02 * max(0, episode_steps - 6)
+                trajectory_score -= 0.04 * max(0, num_branches - 3)
 
                 candidate_infos.append(
                     {
