@@ -40,6 +40,8 @@ def main() -> int:
     ap.add_argument("--num_layers", type=int, default=2)
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--history_len", type=int, default=1)
+    ap.add_argument("--use_action_weights", action="store_true")
+    ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -48,8 +50,13 @@ def main() -> int:
     with open(args.traces, "r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
+            if args.filter_min_trajectory_score is not None and float(row.get("trajectory_score", 0.0)) < args.filter_min_trajectory_score:
+                continue
             obs.append(row["obs"])
             acts.append(row["action"])
+
+    if not obs:
+        raise ValueError("No traces left after filtering; lower --filter_min_trajectory_score or check input")
 
     x = torch.tensor(obs, dtype=torch.float32)
     y = torch.tensor(acts, dtype=torch.long)
@@ -68,7 +75,14 @@ def main() -> int:
     )
     model = build_policy(cfg)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.CrossEntropyLoss()
+    if args.use_action_weights:
+        counts = torch.bincount(y, minlength=act_dim).float()
+        weights = torch.where(counts > 0, 1.0 / counts, torch.zeros_like(counts))
+        if weights.sum() > 0:
+            weights = weights / weights.mean().clamp_min(1e-6)
+        loss_fn = nn.CrossEntropyLoss(weight=weights)
+    else:
+        loss_fn = nn.CrossEntropyLoss()
 
     metrics = []
     model.train()
