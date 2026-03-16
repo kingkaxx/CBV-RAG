@@ -85,16 +85,31 @@ def main() -> int:
     ap.add_argument("--adv_temperature", type=float, default=1.0)
     ap.add_argument("--entropy_coef", type=float, default=0.0)
     ap.add_argument("--success_bonus", type=float, default=0.0)
+    ap.add_argument("--init_policy", default=None)
     ap.add_argument("--correctness_reward", type=float, default=1.0)
     ap.add_argument("--token_penalty", type=float, default=0.001)
     ap.add_argument("--retrieval_penalty", type=float, default=0.05)
     ap.add_argument("--branch_penalty", type=float, default=0.1)
     ap.add_argument("--verify_bonus", type=float, default=0.02)
     ap.add_argument("--early_stop_bonus", type=float, default=0.05)
+    ap.add_argument("--support_hit_reward", type=float, default=0.15)
+    ap.add_argument("--support_full_reward", type=float, default=0.25)
+    ap.add_argument("--support_rank_reward", type=float, default=0.1)
+    ap.add_argument("--discrimination_reward", type=float, default=0.1)
+    ap.add_argument("--contradiction_bonus", type=float, default=0.1)
+    ap.add_argument("--disable_support_reward", action="store_true")
+    ap.add_argument("--disable_verification_reward", action="store_true")
+    ap.add_argument("--disable_efficiency_penalty", action="store_true")
+    ap.add_argument("--disable_counterfactual_discrimination_reward", action="store_true")
+    ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
     args = ap.parse_args()
 
     set_seed(args.seed)
     rows = load_rows(args.traces)
+    if args.filter_min_trajectory_score is not None:
+        rows = [r for r in rows if float(r.get("trajectory_score", 0.0)) >= args.filter_min_trajectory_score]
+    if not rows:
+        raise ValueError("No traces left after filtering; lower --filter_min_trajectory_score or check input")
     obs = torch.tensor([r["obs"] for r in rows], dtype=torch.float32)
     act = torch.tensor([r["action"] for r in rows], dtype=torch.long)
 
@@ -105,12 +120,23 @@ def main() -> int:
         branch_penalty=args.branch_penalty,
         verify_bonus=args.verify_bonus,
         early_stop_bonus=args.early_stop_bonus,
+        support_hit_reward=args.support_hit_reward,
+        support_full_reward=args.support_full_reward,
+        support_rank_reward=args.support_rank_reward,
+        discrimination_reward=args.discrimination_reward,
+        contradiction_bonus=args.contradiction_bonus,
+        use_support_reward=not args.disable_support_reward,
+        use_verification_reward=not args.disable_verification_reward,
+        use_efficiency_penalty=not args.disable_efficiency_penalty,
+        use_counterfactual_discrimination_reward=not args.disable_counterfactual_discrimination_reward,
     )
     rew = build_reward_tensor(rows, reward_cfg, success_bonus=args.success_bonus)
 
     val_obs = val_act = val_rew = None
     if args.val_traces:
         val_rows = load_rows(args.val_traces)
+        if args.filter_min_trajectory_score is not None:
+            val_rows = [r for r in val_rows if float(r.get("trajectory_score", 0.0)) >= args.filter_min_trajectory_score]
         if val_rows:
             val_obs = torch.tensor([r["obs"] for r in val_rows], dtype=torch.float32)
             val_act = torch.tensor([r["action"] for r in val_rows], dtype=torch.long)
@@ -127,9 +153,14 @@ def main() -> int:
         history_len=args.history_len,
     )
     model = build_policy(cfg)
+    if args.init_policy:
+        init_ckpt = torch.load(args.init_policy, map_location="cpu")
+        model.load_state_dict(init_ckpt["state_dict"], strict=False)
+        print(json.dumps({"init_policy": args.init_policy, "status": "loaded"}))
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     metrics = []
+    best_metric = float("-inf")
     for epoch in range(1, args.epochs + 1):
         logits = model(obs)
         logp = F.log_softmax(logits, dim=-1)
@@ -173,6 +204,16 @@ def main() -> int:
             rec.update({f"val_{k}": v for k, v in eval_metrics(model, val_obs, val_act, val_rew).items()})
         metrics.append(rec)
         print(json.dumps(rec))
+
+        monitor = rec.get("val_avg_reward", rec.get("train_avg_reward", 0.0))
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        latest_path = out.with_name(out.stem + ".latest" + out.suffix)
+        torch.save({"state_dict": model.state_dict(), "obs_dim": obs.shape[1], "act_dim": act_dim, "epoch": epoch}, latest_path)
+        if monitor > best_metric:
+            best_metric = monitor
+            best_path = out.with_name(out.stem + ".best" + out.suffix)
+            torch.save({"state_dict": model.state_dict(), "obs_dim": obs.shape[1], "act_dim": act_dim, "epoch": epoch, "best_metric": best_metric}, best_path)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
