@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List
 
+from cbvrag.evidence_clusters import cluster_evidence_items
+
 
 def _jaccard(a: str, b: str) -> float:
     sa = set(a.lower().split())
@@ -24,58 +26,97 @@ def select_context(
     max_tokens: int = 1500,
     strategy: str = "mmr",
 ) -> List[Dict]:
+    # cluster-aware first; deterministic fallback to legacy strategy if needed.
+    clusters = cluster_evidence_items(candidates)
+    selected = select_context_cluster_aware(
+        question=query,
+        pool=candidates,
+        cluster_info=clusters,
+        tokenizer=tokenizer,
+        max_chunks=max_chunks,
+        max_tokens=max_tokens,
+    )
+    if selected:
+        return selected
+
     sorted_candidates = sorted(
         candidates,
         key=lambda c: c.get("rerank_score", c.get("retriever_score", 0.0)),
         reverse=True,
     )
-    selected: List[Dict] = []
+    selected = []
     used_tokens = 0
-
-    titles_in_pool = {_title(c) for c in sorted_candidates if _title(c)}
-    target_min_titles = 2 if len(titles_in_pool) >= 2 else 1
     per_title_count = defaultdict(int)
 
-    def _try_add(cand: Dict) -> bool:
-        nonlocal used_tokens
+    for cand in sorted_candidates:
         if len(selected) >= max_chunks:
-            return False
+            break
         text = cand.get("text", "")
         tks = len(tokenizer(text, add_special_tokens=False).input_ids)
         if used_tokens + tks > max_tokens:
-            return False
+            continue
         if strategy == "mmr" and selected:
             max_sim = max(_jaccard(text, s.get("text", "")) for s in selected)
             if max_sim > 0.85:
-                return False
-        # avoid one title crowding everything out
+                continue
         title = _title(cand)
         if title and per_title_count[title] >= max(2, max_chunks // 2):
-            return False
+            continue
         selected.append(cand)
         used_tokens += tks
         if title:
             per_title_count[title] += 1
-        return True
 
-    # pass 1: diversify by title among top-ranked evidence
-    if target_min_titles >= 2:
-        seen_titles = set()
-        for cand in sorted_candidates:
-            if len(seen_titles) >= target_min_titles or len(selected) >= max_chunks:
-                break
-            title = _title(cand)
-            if not title or title in seen_titles:
-                continue
-            if _try_add(cand):
-                seen_titles.add(title)
+    return selected
 
-    # pass 2: fill remaining slots by score, with redundancy/title checks.
-    for cand in sorted_candidates:
+
+
+def select_context_cluster_aware(
+    question: str,
+    pool: List[Dict],
+    cluster_info,
+    tokenizer,
+    max_chunks: int,
+    max_tokens: int,
+    per_cluster_soft_cap: int = 2,
+    rerank_weight: float = 1.0,
+    specificity_weight: float = 0.7,
+    resistance_weight: float = 0.5,
+    diversity_bonus: float = 0.2,
+    redundancy_penalty: float = 0.2,
+) -> List[Dict]:
+    selected: List[Dict] = []
+    used_tokens = 0
+    per_cluster_count = defaultdict(int)
+
+    cluster_by_eid = {}
+    for c in cluster_info or []:
+        cid = c.get("cluster_id", "")
+        for eid in c.get("member_ids", []) or []:
+            cluster_by_eid[str(eid)] = cid
+
+    def _score(cand: Dict) -> float:
+        rerank = float(cand.get("rerank_score", cand.get("retriever_score", 0.0)))
+        spec = float(cand.get("specificity", 0.0))
+        resist = float(cand.get("counterfactual_resistance", 0.0))
+        cid = cluster_by_eid.get(str(cand.get("evidence_id", "")), "")
+        div = diversity_bonus if per_cluster_count[cid] == 0 else 0.0
+        red = redundancy_penalty * max(0, per_cluster_count[cid] - per_cluster_soft_cap + 1)
+        return rerank_weight * rerank + specificity_weight * spec + resistance_weight * resist + div - red
+
+    ranked = sorted(pool, key=_score, reverse=True)
+    for cand in ranked:
         if len(selected) >= max_chunks:
             break
-        if cand in selected:
+        text = cand.get("text", "")
+        tks = len(tokenizer(text, add_special_tokens=False).input_ids)
+        if used_tokens + tks > max_tokens:
             continue
-        _try_add(cand)
+        cid = cluster_by_eid.get(str(cand.get("evidence_id", "")), "")
+        if per_cluster_count[cid] >= max(1, per_cluster_soft_cap + max_chunks // 4):
+            continue
+        selected.append(cand)
+        used_tokens += tks
+        per_cluster_count[cid] += 1
 
     return selected

@@ -4,6 +4,8 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Tuple
 
 from cbvrag.actions import Action
+from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
+from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.features import build_features
 from cbvrag.prompts import answer_prompt, counterfactual_prompt, verify_prompt
 from cbvrag.state import Branch, EpisodeState, EvidenceItem
@@ -51,115 +53,75 @@ def _make_state(question: str, qid: str, budgets: Dict) -> EpisodeState:
     )
 
 
-def _selected_snippets(state: EpisodeState, max_items: int | None = None) -> List[str]:
-    ids = state.selected_evidence_ids if max_items is None else state.selected_evidence_ids[:max_items]
-    return [state.evidence_pool[eid].short_claim for eid in ids if eid in state.evidence_pool]
 
 
-def _can_stop_now(state: EpisodeState) -> bool:
-    retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
-    selected_nonempty = len(state.selected_evidence_ids) > 0
-    return selected_nonempty and (retrieval_calls >= 2 or state.verification_status == "supported")
+def _pool_as_dicts(state: EpisodeState) -> list[dict]:
+    selected = set(state.selected_evidence_ids)
+    return [
+        {
+            "evidence_id": e.evidence_id,
+            "doc_id": e.doc_id,
+            "chunk_id": e.chunk_id,
+            "title": e.title,
+            "rerank_score": float(e.rerank_score),
+            "retriever_score": float(e.retriever_score),
+            "text": e.short_claim,
+            "is_selected": e.evidence_id in selected,
+            "branch_id": e.branch_id,
+        }
+        for e in state.evidence_pool.values()
+    ]
 
 
-def compute_action_mask(state: EpisodeState) -> List[bool]:
-    action_mask = [True] * len(Action)
+def _update_cluster_specificity_metrics(state: EpisodeState) -> None:
+    items = _pool_as_dicts(state)
+    clusters = cluster_evidence_items(items)
+    cluster_stats = summarize_cluster_stats(clusters)
+    cluster_map = {}
+    for c in clusters:
+        cid = c.get("cluster_id", "")
+        for eid in c.get("member_ids", []) or []:
+            cluster_map[eid] = cid
 
-    last_action = int(state.metrics.get("last_action", -1))
-    second_last_action = int(state.metrics.get("second_last_action", -1))
-    no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
-    selected_changed = int(state.metrics.get("selected_evidence_changed", 1))
-    pool_changed = int(state.metrics.get("evidence_pool_changed", 1))
-    retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
-
-    selected_nonempty = len(state.selected_evidence_ids) > 0
-    pool_nonempty = len(state.evidence_pool) > 0
-    branches_open = len(state.branches) < state.budgets["max_branches"]
-    branches_prunable = len(state.branches) > 1
-
-    if not pool_nonempty:
-        action_mask[int(Action.SELECT_CONTEXT)] = False
-        action_mask[int(Action.VERIFY_CHEAP)] = False
-    if not selected_nonempty:
-        action_mask[int(Action.VERIFY_LLM)] = False
-        action_mask[int(Action.SUMMARIZE_STATE)] = False
-
-    if last_action == int(Action.SELECT_CONTEXT) and selected_changed == 0:
-        action_mask[int(Action.SELECT_CONTEXT)] = False
-    if last_action == int(Action.SELECT_CONTEXT) and no_progress_streak >= 1:
-        action_mask[int(Action.SELECT_CONTEXT)] = False
-    if selected_nonempty and pool_changed == 0 and selected_changed == 0:
-        action_mask[int(Action.SELECT_CONTEXT)] = False
-
-    no_op_repeat_actions = {
-        int(Action.SELECT_CONTEXT),
-        int(Action.SUMMARIZE_STATE),
-        int(Action.MERGE_BRANCHES),
-        int(Action.PRUNE_BRANCH),
+    retrieved_by_query = {
+        "original": [dict(it, cluster_id=cluster_map.get(str(it.get("evidence_id", "")), "")) for it in items]
     }
-    if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
-        action_mask[last_action] = False
+    spec = score_evidence_specificity(state.question, {"original": state.question, "variants": []}, retrieved_by_query)
+    selected = [eid for eid in state.selected_evidence_ids if eid in spec.get("chunk_scores", {})]
+    selected_scores = [spec["chunk_scores"][eid] for eid in selected]
+    best_spec = max([float(v.get("specificity", 0.0)) for v in spec.get("chunk_scores", {}).values()] or [0.0])
+    best_resist = max([float(v.get("counterfactual_resistance", 0.0)) for v in spec.get("chunk_scores", {}).values()] or [0.0])
+    mean_sel_spec = sum(float(v.get("specificity", 0.0)) for v in selected_scores) / max(1, len(selected_scores))
 
-    if not branches_open:
-        action_mask[int(Action.SPAWN_COUNTERFACTUAL)] = False
-    if not branches_prunable:
-        action_mask[int(Action.PRUNE_BRANCH)] = False
-        action_mask[int(Action.MERGE_BRANCHES)] = False
+    sel_clusters = [cluster_map.get(eid, "") for eid in state.selected_evidence_ids if cluster_map.get(eid, "")]
+    selected_cluster_count = len(set(sel_clusters))
+    same_cluster_frac = 0.0
+    if sel_clusters:
+        same_cluster_frac = max(sel_clusters.count(c) for c in set(sel_clusters)) / max(1, len(sel_clusters))
 
-    if retrieval_calls >= state.budgets["max_retrieval_calls"]:
-        action_mask[int(Action.RETRIEVE_MORE_SMALL)] = False
-        action_mask[int(Action.RETRIEVE_MORE_LARGE)] = False
-
-    can_stop_now = _can_stop_now(state)
-    action_mask[int(Action.STOP_AND_ANSWER)] = can_stop_now
-    action_mask[int(Action.ANSWER_DIRECT)] = can_stop_now
-
-    if not any(action_mask):
-        action_mask[int(Action.STOP_AND_ANSWER)] = True
-    return action_mask
-
-
-def choose_valid_action(
-    proposed_action_idx: int,
-    state: EpisodeState,
-    action_mask: List[bool],
-) -> tuple[Action, bool, int]:
-    """
-    Returns:
-      - resolved action
-      - whether action was forced / replaced
-      - original requested action idx
-    """
-    requested = int(proposed_action_idx)
-    action = Action(requested)
-    action_was_forced = False
-
-    if action_mask[int(action)]:
-        return action, action_was_forced, requested
-
-    action_was_forced = True
-    state.metrics["illegal_action_requested"] = int(state.metrics.get("illegal_action_requested", 0)) + 1
-    state.metrics["forced_action_count"] = int(state.metrics.get("forced_action_count", 0)) + 1
-
-    selected_nonempty = len(state.selected_evidence_ids) > 0
-    pool_nonempty = len(state.evidence_pool) > 0
-    retrieval_calls_now = int(state.metrics.get("retrieval_calls", 0))
-
-    if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_SMALL)]:
-        return Action.RETRIEVE_MORE_SMALL, True, requested
-    if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_LARGE)]:
-        return Action.RETRIEVE_MORE_LARGE, True, requested
-    if action_mask[int(Action.VERIFY_CHEAP)] and pool_nonempty:
-        return Action.VERIFY_CHEAP, True, requested
-    if action_mask[int(Action.SELECT_CONTEXT)] and pool_nonempty:
-        return Action.SELECT_CONTEXT, True, requested
-    if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
-        return Action.STOP_AND_ANSWER, True, requested
-    if action_mask[int(Action.ANSWER_DIRECT)] and selected_nonempty:
-        return Action.ANSWER_DIRECT, True, requested
-
-    fallback_idx = next(i for i, ok in enumerate(action_mask) if ok)
-    return Action(fallback_idx), True, requested
+    state.metrics.update(
+        {
+            **cluster_stats,
+            "selected_cluster_count": float(selected_cluster_count),
+            "selected_cluster_diversity": float(selected_cluster_count / max(1, int(cluster_stats.get("num_clusters", 0) or 1))),
+            "selected_same_cluster_frac": float(same_cluster_frac),
+            "evidence_redundancy_proxy": float(same_cluster_frac),
+            "multi_cluster_support_flag": 1.0 if selected_cluster_count >= 2 else 0.0,
+            "best_specificity_score": float(best_spec),
+            "mean_specificity_selected": float(mean_sel_spec),
+            "best_counterfactual_resistance": float(best_resist),
+            "candidate_count_available": float(selected_cluster_count),
+            "candidate_score_gap_top2": 0.0,
+            "view_disagreement_score": 0.0,
+            "original_specific_cluster_count": float(sum(1 for c in clusters if float(c.get("mean_rerank", 0.0)) >= 0.0)),
+            "cluster_stats": cluster_stats,
+            "specificity_stats": {
+                "best_specificity_score": float(best_spec),
+                "mean_specificity_selected": float(mean_sel_spec),
+                "best_counterfactual_resistance": float(best_resist),
+            },
+        }
+    )
 
 
 def execute_action(state: EpisodeState, action: Action, controller: Any, tools: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,6 +149,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
                 branch_id=state.active_branch_id,
                 title=str(c.get("title") or c.get("meta", {}).get("title", "")),
             )
+        _update_cluster_specificity_metrics(state)
 
     elif action == Action.SELECT_CONTEXT:
         pool = [
@@ -209,6 +172,7 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
             max_tokens=state.budgets["max_context_tokens"],
         )
         state.selected_evidence_ids = [s["evidence_id"] for s in selected]
+        _update_cluster_specificity_metrics(state)
 
     elif action == Action.SPAWN_COUNTERFACTUAL and len(state.branches) < state.budgets["max_branches"]:
         prompt = counterfactual_prompt(state.question, "counter")
@@ -388,6 +352,10 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             action_idx = controller.act(obs, state, action_mask=action_mask)
         except TypeError:
             action_idx = controller.act(obs, state)
+        controller_action = Action(action_idx)
+        requested_action = controller_action
+        action = controller_action
+        action_was_forced = False
 
         action, action_was_forced, requested_action = choose_valid_action(action_idx, state, action_mask)
 
@@ -443,17 +411,24 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
 
         state.metrics["previous_selected_count"] = len(before_selected)
 
-        _append_log(
-            action,
-            costs,
-            selected_evidence_changed,
-            evidence_pool_changed,
-            branch_count_changed,
-            verification_status_changed,
-            made_progress,
-            requested_action=requested_action,
-            action_was_forced=action_was_forced,
-            action_mask=action_mask,
+        logs.append(
+            {
+                "step": state.step,
+                "action": int(action),
+                "action_name": action.name,
+                "requested_action": int(requested_action),
+                "requested_action_name": requested_action.name,
+                "executed_action": int(action),
+                "action_was_forced": bool(action_was_forced),
+                "action_mask": list(action_mask),
+                "costs": costs,
+                "metrics": dict(state.metrics),
+                "selected_evidence_changed": selected_evidence_changed,
+                "evidence_pool_changed": evidence_pool_changed,
+                "branch_count_changed": branch_count_changed,
+                "verification_status_changed": verification_status_changed,
+                "no_progress_streak": int(state.metrics.get("no_progress_streak", 0)),
+            }
         )
 
         if (
@@ -466,7 +441,6 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 else:
                     explicit_stop_used = True
                 explicit_terminal_action = int(action)
-
             if not state.final_answer:
                 _force_terminal_stop()
             break
@@ -495,7 +469,5 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
     out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
     out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
-    out["state"]["metrics"]["explicit_terminal_action"] = (
-        int(explicit_terminal_action) if explicit_terminal_action is not None else -1
-    )
+    out["state"]["metrics"]["explicit_terminal_action"] = int(explicit_terminal_action) if explicit_terminal_action is not None else -1
     return state.final_answer, out

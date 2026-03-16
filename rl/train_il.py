@@ -150,24 +150,27 @@ def main() -> int:
     model = build_policy(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    class_weights = None
+    weights = None
     if args.use_action_weights:
-        counts = torch.bincount(y_all, minlength=act_dim).float()
-        class_weights = torch.where(counts > 0, 1.0 / torch.sqrt(counts), torch.zeros_like(counts))
-        if class_weights.sum() > 0:
-            class_weights = class_weights / class_weights.mean().clamp_min(1e-6)
+        counts = torch.bincount(y_train, minlength=act_dim).float()
+        weights = torch.where(counts > 0, 1.0 / counts, torch.zeros_like(counts))
+        if weights.sum() > 0:
+            weights = weights / weights.mean().clamp_min(1e-6)
 
     if args.terminal_action_boost != 1.0:
         if args.terminal_action_boost <= 0:
             raise ValueError("--terminal_action_boost must be > 0")
-        if class_weights is None:
-            class_weights = torch.ones(act_dim, dtype=torch.float32)
+        if weights is None:
+            weights = torch.ones(act_dim, dtype=torch.float32)
         for terminal_action in (int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)):
-            class_weights[terminal_action] *= float(args.terminal_action_boost)
+            weights[terminal_action] *= float(args.terminal_action_boost)
 
-    if class_weights is not None and class_weights.mean() > 0:
-        class_weights = class_weights / class_weights.mean().clamp_min(1e-6)
-    ce = nn.CrossEntropyLoss(weight=None if class_weights is None else class_weights.to(device), reduction="none")
+    if weights is not None:
+        if weights.mean() > 0:
+            weights = weights / weights.mean().clamp_min(1e-6)
+        loss_fn = nn.CrossEntropyLoss(weight=weights.to(device))
+    else:
+        loss_fn = nn.CrossEntropyLoss()
 
     metrics = []
     best_metric = float("-inf")
@@ -221,46 +224,34 @@ def main() -> int:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    def _build_ckpt(state_dict: dict, tag: str) -> dict:
-        return {
-            "state_dict": state_dict,
-            "obs_dim": obs_dim,
-            "act_dim": act_dim,
-            "arch": {
-                "policy_type": args.policy_type,
-                "hidden_dim": args.hidden_dim,
-                "num_layers": args.num_layers,
-                "dropout": args.dropout,
-                "history_len": args.history_len,
-            },
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
-            "action_enum_version": ACTION_ENUM_VERSION,
-            "action_names": action_names(),
-            "dataset": args.traces,
-            "val_dataset": args.val_traces,
-            "seed": args.seed,
-            "git_commit": get_git_commit(),
-            "checkpoint_tag": tag,
-            "best_selection_metric": best_metric,
-            "hparams": {
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "use_action_weights": bool(args.use_action_weights),
-                "terminal_action_boost": args.terminal_action_boost,
-                "filter_min_trajectory_score": args.filter_min_trajectory_score,
-                "auto_val_ratio": args.auto_val_ratio,
-            },
-        }
-
-    last_ckpt = _build_ckpt(model.state_dict(), tag="last")
-    torch.save(last_ckpt, out)
-
-    best_out = out.with_name(out.stem + "_best" + out.suffix)
-    if best_state is not None:
-        torch.save(_build_ckpt(best_state, tag="best"), best_out)
-
+    ckpt = {
+        "state_dict": model.state_dict(),
+        "obs_dim": obs_dim,
+        "act_dim": act_dim,
+        "arch": {
+            "policy_type": args.policy_type,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "history_len": args.history_len,
+        },
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "action_enum_version": ACTION_ENUM_VERSION,
+        "action_names": action_names(),
+        "dataset": args.traces,
+        "val_dataset": args.val_traces,
+        "seed": args.seed,
+        "git_commit": get_git_commit(),
+        "hparams": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "use_action_weights": bool(args.use_action_weights),
+            "terminal_action_boost": args.terminal_action_boost,
+            "filter_min_trajectory_score": args.filter_min_trajectory_score,
+        },
+    }
+    torch.save(ckpt, out)
     out.with_suffix(".metrics.jsonl").write_text("\n".join(json.dumps(m) for m in metrics) + "\n", encoding="utf-8")
     out.with_suffix(".config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 

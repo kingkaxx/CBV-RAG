@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from cbvrag.actions import Action
 from rl.policy import PolicyConfig, build_policy
 
 
@@ -38,6 +39,11 @@ def main() -> int:
         rew.append(v)
     rew = torch.tensor(rew, dtype=torch.float32)
 
+    act_dim = len(Action)
+    if int(act.max().item()) >= act_dim or int(act.min().item()) < 0:
+        raise ValueError(f"Train traces contain action ids outside Action enum range [0, {act_dim - 1}].")
+    if val_act is not None and (int(val_act.max().item()) >= act_dim or int(val_act.min().item()) < 0):
+        raise ValueError(f"Val traces contain action ids outside Action enum range [0, {act_dim - 1}].")
     cfg = PolicyConfig(
         policy_type=args.policy_type,
         obs_dim=int(obs.shape[1]),
