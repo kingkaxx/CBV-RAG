@@ -32,6 +32,12 @@ from tools.rerank import CrossEncoderReranker
 from tools.retrieve import RetrieverTool
 
 
+EXPLICIT_TERMINAL_ACTIONS = {
+    int(Action.STOP_AND_ANSWER),
+    int(Action.ANSWER_DIRECT),
+}
+
+
 def resolve_llm_device(requested: str | None) -> str:
     if requested:
         device = requested
@@ -53,27 +59,47 @@ def fmt_ratio(num: float, den: float) -> float:
 
 
 def _action_sequence(log: Dict) -> List[int]:
-    return [int(s.get("action")) for s in log.get("steps", []) if isinstance(s, dict) and s.get("action") is not None]
+    return [
+        int(s.get("action"))
+        for s in log.get("steps", [])
+        if isinstance(s, dict) and s.get("action") is not None
+    ]
+
+
+def _executed_steps(log: Dict) -> List[Dict]:
+    return [s for s in (log.get("steps", []) or []) if isinstance(s, dict)]
+
+
+def _is_explicit_terminal_action(action_idx: int) -> bool:
+    return int(action_idx) in EXPLICIT_TERMINAL_ACTIONS
+
+
+def _has_explicit_stop_flag(log: Dict) -> bool:
+    return bool(log.get("explicit_stop_used", False))
+
+
+def _is_explicit_terminal(log: Dict, action_sequence: List[int]) -> bool:
+    """
+    Robust terminal check:
+    1. Prefer action-based classification.
+    2. Fall back to explicit_stop_used for older/newer log variants.
+    """
+    if action_sequence:
+        if _is_explicit_terminal_action(action_sequence[-1]):
+            return True
+    return _has_explicit_stop_flag(log)
 
 
 def _explicit_early_stop(log: Dict) -> bool:
-    if "explicit_stop_used" in log:
-        return bool(log.get("explicit_stop_used", False))
-
-    # Backward-compatible fallback for older logs.
-    steps = log.get("steps", [])
+    steps = _executed_steps(log)
     if not steps:
         return False
+
     budgets = (log.get("state") or {}).get("budgets", {})
     max_steps = int(budgets.get("max_steps", len(steps)))
-    last = steps[-1]
-    action_name = str(last.get("action_name", ""))
-    action_idx = int(last.get("action", -1)) if last.get("action") is not None else -1
-    explicit_terminate = action_name in {"STOP_AND_ANSWER", "ANSWER_DIRECT"} or action_idx in {
-        int(Action.STOP_AND_ANSWER),
-        int(Action.ANSWER_DIRECT),
-    }
-    return explicit_terminate and len(steps) < max_steps
+    action_sequence = _action_sequence(log)
+
+    return _is_explicit_terminal(log, action_sequence) and len(steps) < max_steps
 
 
 def _behavior_signature(cand: Dict) -> str:
@@ -95,11 +121,10 @@ def _last_action_is(cand: Dict, action: Action) -> bool:
 def _is_successful_explicit_stop(cand: Dict) -> bool:
     if not cand.get("success", False):
         return False
-    return _last_action_is(cand, Action.STOP_AND_ANSWER) or _last_action_is(cand, Action.ANSWER_DIRECT)
+    return bool(cand.get("explicit_terminal", False))
 
 
 def _is_short_successful_stop_bucket(cand: Dict) -> bool:
-    # keep compact successful trajectories that terminate explicitly soon after useful context setup
     if not _is_successful_explicit_stop(cand):
         return False
     if not cand.get("had_selected_evidence", False):
@@ -108,8 +133,6 @@ def _is_short_successful_stop_bucket(cand: Dict) -> bool:
     if len(seq) <= 3:
         return True
     return len(seq) <= 4 and int(Action.VERIFY_CHEAP) in seq
-
-
 
 
 def _is_preferred_short_stop_sequence(seq: List[int]) -> bool:
@@ -125,11 +148,15 @@ def _is_preferred_short_stop_sequence(seq: List[int]) -> bool:
     }
     return tuple(seq) in preferred
 
+
 def _pick_shortest_successful_terminal(pool: List[Dict], action: Action) -> Dict | None:
     matches = [c for c in pool if c.get("success", False) and _last_action_is(c, action)]
     if not matches:
         return None
-    return min(matches, key=lambda c: (c.get("steps", 10**9), c.get("tokens", 10**9), -c.get("trajectory_score", 0.0)))
+    return min(
+        matches,
+        key=lambda c: (c.get("steps", 10**9), c.get("tokens", 10**9), -c.get("trajectory_score", 0.0)),
+    )
 
 
 def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success: bool) -> List[Dict]:
@@ -157,23 +184,27 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
         if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
             chosen.append(c)
 
-    # Retention bucket: preserve short successful explicit-stop traces even if a longer trace scores slightly higher.
     short_successful_stops = [c for c in pool if _is_short_successful_stop_bucket(c)]
     preferred_short_stops = [c for c in short_successful_stops if _is_preferred_short_stop_sequence(c.get("action_sequence", []))]
+
     for c in sorted(preferred_short_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
         if len(chosen) >= keep_n:
             break
         _add_if_new(c)
+
     for c in sorted(short_successful_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
         if len(chosen) >= keep_n:
             break
         _add_if_new(c)
 
-    # Keep at least one shortest successful terminal trace when available.
     stop_shortest = _pick_shortest_successful_terminal(pool, Action.STOP_AND_ANSWER)
     answer_direct_shortest = _pick_shortest_successful_terminal(pool, Action.ANSWER_DIRECT)
     if stop_shortest is not None and answer_direct_shortest is not None:
-        preferred = stop_shortest if (stop_shortest["steps"], stop_shortest["tokens"]) <= (answer_direct_shortest["steps"], answer_direct_shortest["tokens"]) else answer_direct_shortest
+        preferred = (
+            stop_shortest
+            if (stop_shortest["steps"], stop_shortest["tokens"]) <= (answer_direct_shortest["steps"], answer_direct_shortest["tokens"])
+            else answer_direct_shortest
+        )
         _add_if_new(preferred)
     else:
         _add_if_new(stop_shortest or answer_direct_shortest)
@@ -271,7 +302,11 @@ def main() -> int:
     retriever = KnowledgeBaseRetriever(models["embedding_model"])
     tools = {
         "llm": LLMEngine(
-            model_name_or_path=getattr(models["llm_model"], "name_or_path", models["llm_model"].config._name_or_path),
+            model_name_or_path=getattr(
+                models["llm_model"],
+                "name_or_path",
+                models["llm_model"].config._name_or_path,
+            ),
             device=llm_device,
         ),
         "retrieve": RetrieverTool(retriever),
@@ -319,18 +354,21 @@ def main() -> int:
                 running_after = int(tools["llm"].usage_tracker.summary().get("total_tokens", 0))
                 cand_tokens = max(0, running_after - running_before)
 
+                executed_steps = _executed_steps(log)
+                action_sequence = _action_sequence(log)
+                episode_steps = len(executed_steps)
+
                 state_metrics = log.get("state", {}).get("metrics", {})
                 retrieval_calls = int(state_metrics.get("retrieval_calls", 0))
                 verify_calls = int(state_metrics.get("verify_calls", 0))
                 llm_calls = int(state_metrics.get("llm_calls", 0))
-                episode_steps = len(controller.trace)
                 num_branches = len(log.get("state", {}).get("branches", {}))
 
-                action_sequence = _action_sequence(log)
                 explicit_early_stop = _explicit_early_stop(log)
 
                 golds = ex.get("answer") or [""]
                 em, f1, success = compute_episode_quality(pred, golds)
+
                 support_titles = set(ex.get("support_titles") or [])
                 retrieved_titles = {
                     (ev.get("title") or "").strip()
@@ -365,25 +403,22 @@ def main() -> int:
                 final_state = log.get("state", {}) or {}
                 had_selected_evidence = len(final_state.get("selected_evidence_ids", []) or []) > 0
                 final_action = action_sequence[-1] if action_sequence else -1
-                explicit_terminal = final_action in {int(Action.STOP_AND_ANSWER), int(Action.ANSWER_DIRECT)}
+                explicit_terminal = _is_explicit_terminal(log, action_sequence)
+
                 verify_steps = sum(1 for a in action_sequence if a == int(Action.VERIFY_CHEAP))
                 verify_no_improvement = sum(
                     1
-                    for s in (log.get("steps", []) or [])
-                    if isinstance(s, dict)
-                    and int(s.get("action", -1)) == int(Action.VERIFY_CHEAP)
+                    for s in executed_steps
+                    if int(s.get("action", -1)) == int(Action.VERIFY_CHEAP)
                     and int(s.get("verification_status_changed", 0)) == 0
                 )
 
-                # stronger preference for efficient, explicit, successful terminations after context selection
                 if success:
                     trajectory_score += 0.25 * (1.0 if explicit_early_stop else 0.0)
                     if explicit_terminal and had_selected_evidence:
-                        trajectory_score += 0.45
-                        trajectory_score += 0.10
+                        trajectory_score += 0.55
                         trajectory_score -= 0.07 * max(0, verify_steps - 1)
 
-                # penalize repeated VERIFY_CHEAP especially when status does not improve
                 trajectory_score -= 0.04 * max(0, verify_steps - 1)
                 trajectory_score -= 0.12 * float(verify_no_improvement)
                 trajectory_score -= 0.04 * max(0, episode_steps - 5)
@@ -402,6 +437,7 @@ def main() -> int:
                         "steps": episode_steps,
                         "num_branches": num_branches,
                         "explicit_early_stop": explicit_early_stop,
+                        "explicit_terminal": explicit_terminal,
                         "success": bool(success),
                         "em": float(em),
                         "f1": float(f1),
@@ -438,28 +474,28 @@ def main() -> int:
                 if args.max_episode_steps is not None and cand["steps"] > args.max_episode_steps:
                     continue
 
-                episodes_completed += 1
-                success_count += int(bool(cand["success"]))
-                step_counts.append(cand["steps"])
-                token_counts.append(cand["tokens"])
-                retrieval_counts.append(cand["retrieval_calls"])
-
-                executed_steps = [s for s in (cand["log"].get("steps", []) or []) if isinstance(s, dict)]
+                executed_steps = _executed_steps(cand["log"])
                 if not executed_steps:
-                    print(f"[collect_traces][warn] skipping episode with no executed steps qid={qid} cand_idx={cand['cand_idx']}", flush=True)
+                    print(
+                        f"[collect_traces][warn] skipping episode with no executed steps qid={qid} cand_idx={cand['cand_idx']}",
+                        flush=True,
+                    )
                     continue
 
                 controller_trace = cand["controller"].trace if hasattr(cand["controller"], "trace") else []
                 can_fallback_obs = len(controller_trace) == len(executed_steps)
                 written_actions = []
                 last_obs = None
+
                 for t, step_rec in enumerate(executed_steps):
                     info = dict(step_rec)
                     obs = step_rec.get("obs")
+
                     if obs is None and can_fallback_obs and t < len(controller_trace):
                         ctr = controller_trace[t]
                         if isinstance(ctr, dict):
                             obs = ctr.get("obs")
+
                     if obs is None:
                         if last_obs is not None:
                             obs = last_obs
@@ -477,12 +513,13 @@ def main() -> int:
                     action = int(step_rec.get("action", -1))
                     last_obs = obs
                     written_actions.append(action)
+
                     row = {
                         "qid": qid,
                         "episode_id": f"{qid}::{cand['cand_idx']}",
                         "episode_index": i,
                         "episode_step_index": t,
-                        "episode_num_steps": cand["steps"],
+                        "episode_num_steps": len(executed_steps),
                         "obs": obs,
                         "action": action,
                         "reward": float(step_rec.get("reward", 0.0)),
@@ -502,8 +539,8 @@ def main() -> int:
                         "episode_final_explicit_stop": cand.get("explicit_stop_used", False),
                         "episode_final_forced_stop": cand.get("forced_stop_used", False),
                         "explicit_early_stop": cand["explicit_early_stop"],
+                        "explicit_terminal": cand["explicit_terminal"],
                         "action_sequence": cand["action_sequence"],
-                        # richer optional schema
                         "oracle_name": cand["oracle_name"],
                         "case_profile": cand["case_profile"],
                         "candidate_rank": rank,
@@ -527,24 +564,27 @@ def main() -> int:
                     f.write(json.dumps(row) + "\n")
                     rows_written += 1
 
-                if not written_actions:
-                    print(f"[collect_traces][warn] skipped entire episode due to missing obs qid={qid} cand_idx={cand['cand_idx']}", flush=True)
-                    continue
-
                 if written_actions != cand["action_sequence"]:
                     print(
                         f"[collect_traces][warn] written action rows differ from action_sequence qid={qid} cand_idx={cand['cand_idx']} written={written_actions} expected={cand['action_sequence']}",
                         flush=True,
                     )
-                if written_actions[-1] != cand["action_sequence"][-1]:
+
+                if written_actions and cand["action_sequence"] and written_actions[-1] != cand["action_sequence"][-1]:
                     print(
                         f"[collect_traces][warn] terminal action mismatch qid={qid} cand_idx={cand['cand_idx']} written_last={written_actions[-1]} expected_last={cand['action_sequence'][-1]}",
                         flush=True,
                     )
 
-                terminal_action = int(written_actions[-1])
+                episodes_completed += 1
+                success_count += int(bool(cand["success"]))
+                step_counts.append(len(executed_steps))
+                token_counts.append(cand["tokens"])
+                retrieval_counts.append(cand["retrieval_calls"])
+
+                terminal_action = int(written_actions[-1]) if written_actions else -1
                 terminal_action_hist[terminal_action] += 1
-                if terminal_action not in {int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)}:
+                if not cand["explicit_terminal"]:
                     terminal_not_explicit_count += 1
 
             if (i + 1) % max(1, args.progress_every) == 0 or i + 1 == total:
@@ -557,6 +597,8 @@ def main() -> int:
                     f"avg_retrieval_calls={mean(retrieval_counts) if retrieval_counts else 0:.2f}",
                     flush=True,
                 )
+
+    explicit_terminal_str = "{" + ",".join(map(str, sorted(EXPLICIT_TERMINAL_ACTIONS))) + "}"
 
     summary = {
         "dataset": args.dataset,
@@ -572,14 +614,17 @@ def main() -> int:
         "avg_tokens": mean(token_counts) if token_counts else 0.0,
         "avg_retrieval_calls": mean(retrieval_counts) if retrieval_counts else 0.0,
         "terminal_action_histogram": {str(k): int(v) for k, v in sorted(terminal_action_hist.items())},
-        "terminal_actions_not_in_0_or_10": int(terminal_not_explicit_count),
+        "explicit_terminal_actions": sorted(EXPLICIT_TERMINAL_ACTIONS),
+        "terminal_actions_not_explicit": int(terminal_not_explicit_count),
         "llm_device": llm_device,
     }
+
     if terminal_not_explicit_count > 0:
         print(
-            f"[collect_traces][warn] detected {terminal_not_explicit_count} episodes with terminal action not in {{0,10}}",
+            f"[collect_traces][warn] detected {terminal_not_explicit_count} episodes with terminal action not classified explicit; action-id explicit set={explicit_terminal_str}",
             flush=True,
         )
+
     print("[collect_traces] Final summary:")
     print(json.dumps(summary, indent=2), flush=True)
     return 0
