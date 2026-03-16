@@ -73,6 +73,18 @@ def _terminal_action_hist(episodes: Dict[str, List[Dict]]) -> Dict[str, int]:
     return {str(k): int(v) for k, v in sorted(c.items()) if k >= 0}
 
 
+
+
+
+def _warn_terminal_action_disappearance(kept_terminal_hist: Dict[str, int], train_terminal_hist: Dict[str, int]) -> None:
+    for action_idx in (int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)):
+        a = str(action_idx)
+        if int(kept_terminal_hist.get(a, 0)) > 0 and int(train_terminal_hist.get(a, 0)) == 0:
+            print(
+                f"[prepare_traces][warn] terminal action {action_idx} present in kept episodes but missing from train terminal split",
+                flush=True,
+            )
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -157,6 +169,7 @@ def main() -> int:
     val_hist = _action_hist(val_rows)
     train_terminal_hist = _terminal_action_hist(train_eps)
     val_terminal_hist = _terminal_action_hist(val_eps)
+    kept_terminal_hist = _terminal_action_hist(kept_episodes)
 
     kept_actions = {int(a) for a in kept_raw_hist}
     train_actions = {int(a) for a in train_hist}
@@ -166,11 +179,7 @@ def main() -> int:
             f"[prepare_traces][warn] actions present in kept episodes disappeared from train split: {disappeared_actions}",
             flush=True,
         )
-    if int(Action.STOP_AND_ANSWER) in kept_actions and int(Action.STOP_AND_ANSWER) not in train_actions:
-        print(
-            f"[prepare_traces][warn] STOP_AND_ANSWER ({int(Action.STOP_AND_ANSWER)}) present in kept episodes but missing from train split",
-            flush=True,
-        )
+    _warn_terminal_action_disappearance(kept_terminal_hist, train_terminal_hist)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +218,7 @@ def main() -> int:
         "train_success_rate": agg(train_rows, "success"),
         "val_success_rate": agg(val_rows, "success"),
         "kept_raw_action_histogram": kept_raw_hist,
+        "kept_terminal_action_histogram": kept_terminal_hist,
         "train_action_histogram": train_hist,
         "val_action_histogram": val_hist,
         "train_terminal_action_histogram": train_terminal_hist,

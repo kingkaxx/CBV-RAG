@@ -5,7 +5,7 @@ from typing import List
 from cbvrag.state import EpisodeState
 
 
-FEATURE_SCHEMA_VERSION = "cbvrag_features_v2"
+FEATURE_SCHEMA_VERSION = "cbvrag_features_v3"
 
 
 def _one_hot_verification(status: str) -> List[float]:
@@ -79,6 +79,8 @@ def build_features(state: EpisodeState) -> List[float]:
     near_retrieval_exhaustion = 1.0 if retrieval_calls >= max(1, max_retrieval - 1) else 0.0
     near_step_exhaustion = 1.0 if state.step >= max(1, max_steps - 1) else 0.0
     context_pressure = selected_count / max_context_chunks
+    selected_nonempty = 1.0 if selected_count > 0 else 0.0
+    retrieval_nonempty = 1.0 if retrieval_calls > 0 else 0.0
     score_std_proxy = abs(best - mean_topk)
     conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
 
@@ -100,6 +102,8 @@ def build_features(state: EpisodeState) -> List[float]:
             near_retrieval_exhaustion,
             near_step_exhaustion,
             context_pressure,
+            selected_nonempty,
+            retrieval_nonempty,
             float(len(unique_titles)),
             score_std_proxy,
             conflicting_evidence,
