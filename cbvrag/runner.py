@@ -149,6 +149,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     fallback_stop_was_used = False
     explicit_stop_used = False
     forced_stop_used = False
+    explicit_terminal_action = None
 
     def _should_debug(qid_value: str) -> bool:
         try:
@@ -284,6 +285,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                     forced_stop_used = True
                 else:
                     explicit_stop_used = True
+                explicit_terminal_action = int(action)
             if not state.final_answer:
                 execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
                 fallback_stop_was_used = True
@@ -313,9 +315,11 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         "fallback_stop_was_used": fallback_stop_was_used,
         "explicit_stop_used": explicit_stop_used,
         "forced_stop_used": forced_stop_used,
+        "explicit_terminal_action": explicit_terminal_action,
     }
     out["state"].setdefault("metrics", {})
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
     out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
     out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
+    out["state"]["metrics"]["explicit_terminal_action"] = int(explicit_terminal_action) if explicit_terminal_action is not None else -1
     return state.final_answer, out

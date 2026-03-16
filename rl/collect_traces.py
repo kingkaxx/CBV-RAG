@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 from typing import Dict, List
@@ -109,6 +110,21 @@ def _is_short_successful_stop_bucket(cand: Dict) -> bool:
     return len(seq) <= 4 and int(Action.VERIFY_CHEAP) in seq
 
 
+
+
+def _is_preferred_short_stop_sequence(seq: List[int]) -> bool:
+    preferred = {
+        (int(Action.RETRIEVE_MORE_LARGE), int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.SELECT_CONTEXT), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.VERIFY_CHEAP), int(Action.ANSWER_DIRECT)),
+        (int(Action.RETRIEVE_MORE_LARGE), int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.SELECT_CONTEXT), int(Action.STOP_AND_ANSWER)),
+        (int(Action.RETRIEVE_MORE_SMALL), int(Action.SELECT_CONTEXT), int(Action.VERIFY_CHEAP), int(Action.STOP_AND_ANSWER)),
+    }
+    return tuple(seq) in preferred
+
 def _pick_shortest_successful_terminal(pool: List[Dict], action: Action) -> Dict | None:
     matches = [c for c in pool if c.get("success", False) and _last_action_is(c, action)]
     if not matches:
@@ -143,6 +159,11 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
 
     # Retention bucket: preserve short successful explicit-stop traces even if a longer trace scores slightly higher.
     short_successful_stops = [c for c in pool if _is_short_successful_stop_bucket(c)]
+    preferred_short_stops = [c for c in short_successful_stops if _is_preferred_short_stop_sequence(c.get("action_sequence", []))]
+    for c in sorted(preferred_short_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
+        if len(chosen) >= keep_n:
+            break
+        _add_if_new(c)
     for c in sorted(short_successful_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
         if len(chosen) >= keep_n:
             break
@@ -265,6 +286,8 @@ def main() -> int:
     step_counts: List[int] = []
     token_counts: List[int] = []
     retrieval_counts: List[int] = []
+    terminal_action_hist = Counter()
+    terminal_not_explicit_count = 0
 
     with output.open("w", encoding="utf-8") as f:
         for i, ex in enumerate(data):
@@ -357,7 +380,7 @@ def main() -> int:
                     trajectory_score += 0.25 * (1.0 if explicit_early_stop else 0.0)
                     if explicit_terminal and had_selected_evidence:
                         trajectory_score += 0.45
-                        trajectory_score += 0.10 * (1.0 if final_action == int(Action.STOP_AND_ANSWER) else 0.0)
+                        trajectory_score += 0.10
                         trajectory_score -= 0.07 * max(0, verify_steps - 1)
 
                 # penalize repeated VERIFY_CHEAP especially when status does not improve
@@ -421,26 +444,54 @@ def main() -> int:
                 token_counts.append(cand["tokens"])
                 retrieval_counts.append(cand["retrieval_calls"])
 
-                trace = cand["controller"].trace
-                for t, tr in enumerate(trace):
-                    info = tr.get("info", {}) if isinstance(tr, dict) else {}
-                    if not isinstance(info, dict):
-                        info = {}
+                executed_steps = [s for s in (cand["log"].get("steps", []) or []) if isinstance(s, dict)]
+                if not executed_steps:
+                    print(f"[collect_traces][warn] skipping episode with no executed steps qid={qid} cand_idx={cand['cand_idx']}", flush=True)
+                    continue
+
+                controller_trace = cand["controller"].trace if hasattr(cand["controller"], "trace") else []
+                can_fallback_obs = len(controller_trace) == len(executed_steps)
+                written_actions = []
+                last_obs = None
+                for t, step_rec in enumerate(executed_steps):
+                    info = dict(step_rec)
+                    obs = step_rec.get("obs")
+                    if obs is None and can_fallback_obs and t < len(controller_trace):
+                        ctr = controller_trace[t]
+                        if isinstance(ctr, dict):
+                            obs = ctr.get("obs")
+                    if obs is None:
+                        if last_obs is not None:
+                            obs = last_obs
+                            print(
+                                f"[collect_traces][warn] missing obs for executed step; reusing previous obs qid={qid} cand_idx={cand['cand_idx']} step={t}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[collect_traces][warn] missing obs for executed step and no fallback qid={qid} cand_idx={cand['cand_idx']} step={t}; using empty obs",
+                                flush=True,
+                            )
+                            obs = []
+
+                    action = int(step_rec.get("action", -1))
+                    last_obs = obs
+                    written_actions.append(action)
                     row = {
                         "qid": qid,
                         "episode_id": f"{qid}::{cand['cand_idx']}",
                         "episode_index": i,
                         "episode_step_index": t,
                         "episode_num_steps": cand["steps"],
-                        "obs": tr["obs"],
-                        "action": tr["action"],
-                        "reward": tr.get("reward", 0.0),
+                        "obs": obs,
+                        "action": action,
+                        "reward": float(step_rec.get("reward", 0.0)),
                         "reward_components": cand["rewards"],
-                        "done": t == len(trace) - 1,
+                        "done": t == len(executed_steps) - 1,
                         "success": bool(cand["success"]),
                         "terminal_correct": bool(cand["success"]),
                         "info": info,
-                        "episode_trace": cand["log"].get("steps", []),
+                        "episode_trace": executed_steps,
                         "episode_total_reward": cand["episode_total_reward"],
                         "episode_total_tokens": cand["tokens"],
                         "episode_total_retrieval_calls": cand["retrieval_calls"],
@@ -457,7 +508,7 @@ def main() -> int:
                         "case_profile": cand["case_profile"],
                         "candidate_rank": rank,
                         "trajectory_score": cand["trajectory_score"],
-                        "state_features": tr.get("obs", []),
+                        "state_features": obs,
                         "action_reason": info.get("action_reason", ""),
                         "tokens_before": None,
                         "tokens_after": None,
@@ -475,6 +526,26 @@ def main() -> int:
                     }
                     f.write(json.dumps(row) + "\n")
                     rows_written += 1
+
+                if not written_actions:
+                    print(f"[collect_traces][warn] skipped entire episode due to missing obs qid={qid} cand_idx={cand['cand_idx']}", flush=True)
+                    continue
+
+                if written_actions != cand["action_sequence"]:
+                    print(
+                        f"[collect_traces][warn] written action rows differ from action_sequence qid={qid} cand_idx={cand['cand_idx']} written={written_actions} expected={cand['action_sequence']}",
+                        flush=True,
+                    )
+                if written_actions[-1] != cand["action_sequence"][-1]:
+                    print(
+                        f"[collect_traces][warn] terminal action mismatch qid={qid} cand_idx={cand['cand_idx']} written_last={written_actions[-1]} expected_last={cand['action_sequence'][-1]}",
+                        flush=True,
+                    )
+
+                terminal_action = int(written_actions[-1])
+                terminal_action_hist[terminal_action] += 1
+                if terminal_action not in {int(Action.ANSWER_DIRECT), int(Action.STOP_AND_ANSWER)}:
+                    terminal_not_explicit_count += 1
 
             if (i + 1) % max(1, args.progress_every) == 0 or i + 1 == total:
                 print(
@@ -500,8 +571,15 @@ def main() -> int:
         "avg_steps": mean(step_counts) if step_counts else 0.0,
         "avg_tokens": mean(token_counts) if token_counts else 0.0,
         "avg_retrieval_calls": mean(retrieval_counts) if retrieval_counts else 0.0,
+        "terminal_action_histogram": {str(k): int(v) for k, v in sorted(terminal_action_hist.items())},
+        "terminal_actions_not_in_0_or_10": int(terminal_not_explicit_count),
         "llm_device": llm_device,
     }
+    if terminal_not_explicit_count > 0:
+        print(
+            f"[collect_traces][warn] detected {terminal_not_explicit_count} episodes with terminal action not in {{0,10}}",
+            flush=True,
+        )
     print("[collect_traces] Final summary:")
     print(json.dumps(summary, indent=2), flush=True)
     return 0
