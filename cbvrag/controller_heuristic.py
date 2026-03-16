@@ -52,7 +52,7 @@ class HeuristicController:
     def _has_verification_signal(self, state) -> bool:
         return self._verification_calls(state) > 0 or state.verification_status in {"supported", "contradicted"}
 
-    def act(self, obs, state) -> int:
+    def act(self, obs, state, action_mask=None) -> int:
         step = state.step
         selected_count = self._selected_count(state)
         unique_title_count = self._selected_unique_titles(state)

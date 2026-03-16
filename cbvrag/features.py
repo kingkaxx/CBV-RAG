@@ -31,6 +31,10 @@ def build_features(state: EpisodeState) -> List[float]:
     selected_count = len(state.selected_evidence_ids)
     pool_count = len(pool)
     active_branches = len([b for b in state.branches.values() if b.status != "pruned"])
+    last_action = int(state.metrics.get("last_action", -1))
+    no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
+    selected_changed = float(state.metrics.get("selected_evidence_changed", 0))
+    pool_changed = float(state.metrics.get("evidence_pool_changed", 0))
 
     # existing/core features first (backward-compat ordering)
     vec = [
@@ -75,6 +79,9 @@ def build_features(state: EpisodeState) -> List[float]:
     score_std_proxy = abs(best - mean_topk)
     conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
 
+    last_action_norm = (last_action / max(1, len(_one_hot_verification("unknown")) + 8)) if last_action >= 0 else -1.0
+    last_action_onehot = [1.0 if i == last_action else 0.0 for i in range(11)]
+
     vec.extend(
         [
             retrieval_frac,
@@ -94,6 +101,11 @@ def build_features(state: EpisodeState) -> List[float]:
             score_std_proxy,
             conflicting_evidence,
             step_frac,
+            float(no_progress_streak) / max_steps,
+            selected_changed,
+            pool_changed,
+            last_action_norm,
         ]
     )
+    vec.extend(last_action_onehot)
     return [float(v) for v in vec]
