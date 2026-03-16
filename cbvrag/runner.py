@@ -147,6 +147,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     state = _make_state(question, qid=qid or "unknown", budgets=budgets)
     logs = []
     fallback_stop_was_used = False
+    explicit_stop_used = False
 
     def _should_debug(qid_value: str) -> bool:
         try:
@@ -192,10 +193,13 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             action_idx = controller.act(obs, state, action_mask=action_mask)
         except TypeError:
             action_idx = controller.act(obs, state)
-        action = Action(action_idx)
+        controller_action = Action(action_idx)
+        action = controller_action
+        action_was_forced = False
 
         if not action_mask[int(action)]:
             # If controller picked masked action, force a safe fallback with termination preference.
+            action_was_forced = True
             selected_nonempty = len(state.selected_evidence_ids) > 0
             if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
                 action = Action.STOP_AND_ANSWER
@@ -214,12 +218,15 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
 
         # Early-stop safeguard: when controller tries to stop while still uncertain,
         # run one cheap verification first if there is remaining budget.
-        early_step_cutoff = max(2, budgets["max_steps"] // 2)
         if (
             action == Action.STOP_AND_ANSWER
             and state.verification_status == "unknown"
-            and state.step <= early_step_cutoff
             and state.step < budgets["max_steps"] - 1
+            and (
+                len(state.selected_evidence_ids) == 0
+                or int(state.metrics.get("retrieval_calls", 0)) == 0
+                or state.step == 0
+            )
         ):
             action = Action.VERIFY_CHEAP
 
@@ -267,7 +274,12 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             }
         )
 
-        if action == Action.STOP_AND_ANSWER or state.metrics["retrieval_calls"] >= budgets["max_retrieval_calls"]:
+        if (
+            action in (Action.STOP_AND_ANSWER, Action.ANSWER_DIRECT)
+            or state.metrics["retrieval_calls"] >= budgets["max_retrieval_calls"]
+        ):
+            if action in (Action.STOP_AND_ANSWER, Action.ANSWER_DIRECT) and not action_was_forced:
+                explicit_stop_used = True
             if not state.final_answer:
                 execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
                 fallback_stop_was_used = True
@@ -288,7 +300,13 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
         fallback_stop_was_used = True
 
-    out = {"state": asdict(state), "steps": logs, "fallback_stop_was_used": fallback_stop_was_used}
+    out = {
+        "state": asdict(state),
+        "steps": logs,
+        "fallback_stop_was_used": fallback_stop_was_used,
+        "explicit_stop_used": explicit_stop_used,
+    }
     out["state"].setdefault("metrics", {})
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
+    out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
     return state.final_answer, out

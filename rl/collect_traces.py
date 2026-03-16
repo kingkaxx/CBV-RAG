@@ -56,6 +56,10 @@ def _action_sequence(log: Dict) -> List[int]:
 
 
 def _explicit_early_stop(log: Dict) -> bool:
+    if "explicit_stop_used" in log:
+        return bool(log.get("explicit_stop_used", False))
+
+    # Backward-compatible fallback for older logs.
     steps = log.get("steps", [])
     if not steps:
         return False
@@ -309,6 +313,7 @@ def main() -> int:
                         "oracle_name": oracle_name,
                         "case_profile": case_profile,
                         "fallback_stop_was_used": bool(log.get("fallback_stop_was_used", False)),
+                        "explicit_stop_used": bool(log.get("explicit_stop_used", False)),
                         "action_sequence": action_sequence,
                     }
                 )
@@ -359,6 +364,7 @@ def main() -> int:
                         "episode_total_llm_calls": cand["llm_calls"],
                         "episode_num_branches": cand["num_branches"],
                         "episode_final_fallback_stop": cand["fallback_stop_was_used"],
+                        "episode_final_explicit_stop": cand.get("explicit_stop_used", False),
                         "explicit_early_stop": cand["explicit_early_stop"],
                         "action_sequence": cand["action_sequence"],
                         # richer optional schema
