@@ -28,7 +28,7 @@ def _make_state(question: str, qid: str, budgets: Dict) -> EpisodeState:
         branches={"b0": root},
         active_branch_id="b0",
         budgets=budgets,
-        metrics={"retrieval_calls": 0, "rerank_calls": 0, "verify_calls": 0, "llm_calls": 0, "last_action": -1, "no_progress_streak": 0, "selected_evidence_changed": 0, "evidence_pool_changed": 0, "branch_count_changed": 0, "verification_status_changed": 0, "previous_selected_count": 0},
+        metrics={"retrieval_calls": 0, "rerank_calls": 0, "verify_calls": 0, "llm_calls": 0, "last_action": -1, "second_last_action": -1, "no_progress_streak": 0, "selected_evidence_changed": 0, "evidence_pool_changed": 0, "branch_count_changed": 0, "verification_status_changed": 0, "previous_selected_count": 0},
     )
 
 
@@ -160,26 +160,31 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         # Build an action mask to avoid no-progress loops.
         action_mask = [True] * len(Action)
         last_action = int(state.metrics.get("last_action", -1))
+        second_last_action = int(state.metrics.get("second_last_action", -1))
         no_progress_streak = int(state.metrics.get("no_progress_streak", 0))
         selected_changed = int(state.metrics.get("selected_evidence_changed", 1))
         pool_changed = int(state.metrics.get("evidence_pool_changed", 1))
+        retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
+        selected_nonempty = len(state.selected_evidence_ids) > 0
+        pool_nonempty = len(state.evidence_pool) > 0
 
-        if (
-            last_action == int(Action.SELECT_CONTEXT)
-            and selected_changed == 0
-            and pool_changed == 0
-        ):
+        # Stronger SELECT_CONTEXT masking in no-progress cases.
+        if not pool_nonempty:
+            action_mask[int(Action.SELECT_CONTEXT)] = False
+        if last_action == int(Action.SELECT_CONTEXT) and selected_changed == 0:
+            action_mask[int(Action.SELECT_CONTEXT)] = False
+        if last_action == int(Action.SELECT_CONTEXT) and no_progress_streak >= 1:
+            action_mask[int(Action.SELECT_CONTEXT)] = False
+        if selected_nonempty and pool_changed == 0 and selected_changed == 0:
             action_mask[int(Action.SELECT_CONTEXT)] = False
 
-        if last_action in {int(Action.SELECT_CONTEXT), int(Action.SUMMARIZE_STATE), int(Action.MERGE_BRANCHES), int(Action.PRUNE_BRANCH)} and no_progress_streak >= 1:
+        # Direct anti-repeat for non-terminal no-op prone actions.
+        no_op_repeat_actions = {int(Action.SELECT_CONTEXT), int(Action.SUMMARIZE_STATE), int(Action.MERGE_BRANCHES), int(Action.PRUNE_BRANCH)}
+        if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
             action_mask[last_action] = False
 
-        if (
-            no_progress_streak >= 2
-            and int(state.metrics.get("retrieval_calls", 0)) > 0
-            and len(state.selected_evidence_ids) > 0
-        ):
-            # prefer terminating action when we are spinning
+        if retrieval_calls > 0 and selected_nonempty:
+            # Keep terminating actions valid once we have some evidence.
             action_mask[int(Action.STOP_AND_ANSWER)] = True
             action_mask[int(Action.ANSWER_DIRECT)] = True
 
@@ -190,17 +195,20 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         action = Action(action_idx)
 
         if not action_mask[int(action)]:
-            # If controller picked masked action, force a safe fallback.
-            if action_mask[int(Action.STOP_AND_ANSWER)]:
+            # If controller picked masked action, force a safe fallback with termination preference.
+            selected_nonempty = len(state.selected_evidence_ids) > 0
+            if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
                 action = Action.STOP_AND_ANSWER
-            elif action_mask[int(Action.ANSWER_DIRECT)]:
+            elif action_mask[int(Action.ANSWER_DIRECT)] and selected_nonempty:
                 action = Action.ANSWER_DIRECT
+            elif action_mask[int(Action.VERIFY_CHEAP)] and len(state.evidence_pool) > 0:
+                action = Action.VERIFY_CHEAP
             else:
                 action = Action(next(i for i, ok in enumerate(action_mask) if ok))
 
         if _should_debug(state.qid):
             print(
-                f"[run_episode][debug] qid={state.qid} step={state.step} action_idx={action_idx} action={action.name} no_progress={no_progress_streak}",
+                f"[run_episode][debug] qid={state.qid} step={state.step} action_idx={action_idx} action={action.name} no_progress={no_progress_streak} selected_nonempty={len(state.selected_evidence_ids)>0}",
                 flush=True,
             )
 
@@ -235,6 +243,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         verification_status_changed = int(after_ver_status != before_ver_status)
         made_progress = any([selected_evidence_changed, evidence_pool_changed, branch_count_changed, verification_status_changed, after_final != before_final])
 
+        state.metrics["second_last_action"] = int(state.metrics.get("last_action", -1))
         state.metrics["last_action"] = int(action)
         state.metrics["previous_selected_count"] = len(before_selected)
         state.metrics["selected_evidence_changed"] = selected_evidence_changed
@@ -265,7 +274,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             break
 
         if (
-            int(state.metrics.get("no_progress_streak", 0)) >= 2
+            int(state.metrics.get("no_progress_streak", 0)) >= 1
             and int(state.metrics.get("retrieval_calls", 0)) > 0
             and len(state.selected_evidence_ids) > 0
             and state.step < budgets["max_steps"]
