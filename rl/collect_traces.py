@@ -5,32 +5,17 @@ import json
 import random
 from collections import Counter
 from pathlib import Path
-from statistics import mean
-from typing import Dict, List
 
-import torch
-
-import config
-import model_loader
-from cbvrag.actions import Action
-from cbvrag.controller_heuristic import HeuristicController
+# from cbvrag.controller_heuristic import HeuristicController
+from cbvrag.controller_trace_mixture import TraceMixtureController
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
-from retriever import KnowledgeBaseRetriever
-from rl.reward import RewardConfig, compute_reward_components
-from rl.trace_oracles import (
-    TrajectoryScoreConfig,
-    build_oracle_controller,
-    compute_episode_quality,
-    estimate_case_profile_from_example,
-    parse_oracle_mix,
-    sample_oracle_name,
-    score_trajectory,
-)
 from tools.llm import LLMEngine
 from tools.rerank import CrossEncoderReranker
 from tools.retrieve import RetrieverTool
 
+import model_loader
+from retriever import KnowledgeBaseRetriever
 
 def resolve_llm_device(requested: str | None) -> str:
     if requested:
@@ -151,8 +136,49 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
     shortest = sorted_by_short[0]
     chosen: List[Dict] = []
 
-    def _add_if_new(c: Dict | None) -> None:
-        if c is None:
+def _trajectory_score(log: dict, correct: bool) -> float:
+    state = (log.get("state") or {})
+    metrics = state.get("metrics") or {}
+    steps = log.get("steps") or []
+    retrieval_calls = int(metrics.get("retrieval_calls", 0))
+    llm_calls = int(metrics.get("llm_calls", 0))
+    no_progress = int(metrics.get("no_progress_streak", 0))
+    explicit_stop = int(metrics.get("explicit_stop_used", 0))
+    fallback_stop = int(metrics.get("fallback_stop_was_used", 0))
+    forced_stop = int(metrics.get("forced_stop_used", 0))
+    forced_actions = int(metrics.get("forced_action_count", 0))
+    illegal_requested = int(metrics.get("illegal_action_requested", 0))
+
+    score = 1.0 if correct else 0.0
+    score += 0.15 * explicit_stop
+    score -= 0.05 * retrieval_calls
+    score -= 0.03 * llm_calls
+    score -= 0.05 * no_progress
+    score -= 0.10 * fallback_stop
+    score -= 0.08 * forced_stop
+    score -= 0.04 * forced_actions
+    score -= 0.04 * illegal_requested
+    score -= 0.02 * max(0, len(steps) - 4)
+    return float(score)
+
+
+def _maybe_build_temp_index(retriever: KnowledgeBaseRetriever, ex: dict, qid: str) -> None:
+    context_docs = ex.get("context")
+
+    if context_docs is None:
+        return
+
+    try:
+        retriever.build_temp_index_from_docs(context_docs)
+    except Exception as e:
+        print(f"Warning: failed to build temp index for qid={qid}: {e}", flush=True)
+
+
+def _maybe_clear_temp_index(retriever: KnowledgeBaseRetriever) -> None:
+    # Support several possible retriever implementations without breaking.
+    try:
+        if hasattr(retriever, "clear_temp_index"):
+            retriever.clear_temp_index()
             return
         if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
             chosen.append(c)
@@ -209,70 +235,31 @@ def main() -> int:
     ap.add_argument("--cache_dir", default="./huggingface_cache")
     ap.add_argument("--output", default=None)
     ap.add_argument("--num_samples", type=int, default=None)
-    ap.add_argument("--llm_device", default=None)
-    ap.add_argument("--trace_policy", choices=["heuristic", "mixture"], default="heuristic")
-    ap.add_argument("--num_candidates_per_example", type=int, default=4)
-    ap.add_argument("--oracle_mix", default=None)
-    ap.add_argument("--keep_top_n_per_example", type=int, default=1)
-    ap.add_argument("--allow_near_success", action="store_true")
-
-    ap.add_argument("--keep_only_successful", action="store_true")
-    ap.add_argument("--min_episode_reward", type=float, default=None)
-    ap.add_argument("--max_episode_tokens", type=int, default=None)
-    ap.add_argument("--max_episode_steps", type=int, default=None)
-    ap.add_argument("--progress_every", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=42)
-
-    ap.add_argument("--correctness_reward", type=float, default=1.0)
-    ap.add_argument("--token_penalty", type=float, default=0.001)
-    ap.add_argument("--retrieval_penalty", type=float, default=0.05)
-    ap.add_argument("--branch_penalty", type=float, default=0.1)
-    ap.add_argument("--verify_bonus", type=float, default=0.02)
-    ap.add_argument("--early_stop_bonus", type=float, default=0.05)
-
-    ap.add_argument("--score_success_reward", type=float, default=3.0)
-    ap.add_argument("--score_em_reward", type=float, default=1.5)
-    ap.add_argument("--score_f1_reward", type=float, default=1.0)
-    ap.add_argument("--score_support_reward", type=float, default=0.75)
-    ap.add_argument("--score_token_penalty", type=float, default=0.001)
-    ap.add_argument("--score_step_penalty", type=float, default=0.03)
-    ap.add_argument("--score_branch_penalty", type=float, default=0.06)
-    ap.add_argument("--score_redundant_verify_penalty", type=float, default=0.03)
     args = ap.parse_args()
-
-    rng = random.Random(args.seed)
-    llm_device = resolve_llm_device(args.llm_device)
-    print(f"[collect_traces] LLM device: {llm_device}", flush=True)
 
     output = Path(args.output or f"data/traces/{args.dataset}.jsonl")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    reward_cfg = RewardConfig(
-        correctness_reward=args.correctness_reward,
-        token_penalty=args.token_penalty,
-        retrieval_penalty=args.retrieval_penalty,
-        branch_penalty=args.branch_penalty,
-        verify_bonus=args.verify_bonus,
-        early_stop_bonus=args.early_stop_bonus,
-    )
-    score_cfg = TrajectoryScoreConfig(
-        success_reward=args.score_success_reward,
-        em_reward=args.score_em_reward,
-        f1_reward=args.score_f1_reward,
-        support_reward=args.score_support_reward,
-        token_penalty=args.score_token_penalty,
-        step_penalty=args.score_step_penalty,
-        branch_penalty=args.score_branch_penalty,
-        redundant_verify_penalty=args.score_redundant_verify_penalty,
-    )
-    oracle_mix = parse_oracle_mix(args.oracle_mix)
-
     models = model_loader.load_all_models()
     retriever = KnowledgeBaseRetriever(models["embedding_model"])
+
+    # Only datasets like ARC-C need the global FAISS index.
+    # HotpotQA and similar context-provided datasets should use per-example temp indexes.
+    if args.dataset == "arc_c":
+        try:
+            if hasattr(retriever, "load_index"):
+                retriever.load_index()
+        except Exception as e:
+            print(f"Warning: failed to load global index for dataset={args.dataset}: {e}", flush=True)
+
     tools = {
         "llm": LLMEngine(
-            model_name_or_path=getattr(models["llm_model"], "name_or_path", models["llm_model"].config._name_or_path),
-            device=llm_device,
+            model_name_or_path=getattr(
+                models["llm_model"],
+                "name_or_path",
+                models["llm_model"].config._name_or_path,
+            ),
+            device="cuda:0",
         ),
         "retrieve": RetrieverTool(retriever),
         "rerank": CrossEncoderReranker(),

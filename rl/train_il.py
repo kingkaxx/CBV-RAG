@@ -5,12 +5,12 @@ import json
 import random
 import subprocess
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from cbvrag.actions import ACTION_ENUM_VERSION, Action, action_names
 from cbvrag.features import FEATURE_SCHEMA_VERSION
@@ -30,30 +30,54 @@ def get_git_commit() -> str:
         return "unknown"
 
 
-def _load_xy(path: str, min_score: float | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    obs, acts = [], []
+def _load_rows(path: str, min_score: float | None = None) -> List[dict]:
+    rows: List[dict] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
             if min_score is not None and float(row.get("trajectory_score", 0.0)) < min_score:
                 continue
-            obs.append(row["obs"])
-            acts.append(int(row["action"]))
-    if not obs:
+            rows.append(row)
+    if not rows:
         raise ValueError(f"No traces loaded from {path}. Adjust filters or input file.")
-    return torch.tensor(obs, dtype=torch.float32), torch.tensor(acts, dtype=torch.long)
+    return rows
+
+
+def _rows_to_tensors(rows: List[dict], act_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    obs = torch.tensor([r["obs"] for r in rows], dtype=torch.float32)
+    acts = torch.tensor([int(r["action"]) for r in rows], dtype=torch.long)
+
+    if int(acts.max().item()) >= act_dim or int(acts.min().item()) < 0:
+        raise ValueError(
+            f"Trace actions must be within [0, {act_dim - 1}], "
+            f"got min={int(acts.min().item())}, max={int(acts.max().item())}"
+        )
+
+    weights = []
+    for r in rows:
+        w = 1.0
+        w += 0.25 * float(r.get("trajectory_score", 0.0))
+        if bool(r.get("terminal_correct", False)):
+            w += 0.50
+        if bool(r.get("done", False)):
+            w += 0.10
+        weights.append(max(0.05, float(w)))
+    sample_w = torch.tensor(weights, dtype=torch.float32)
+    sample_w = sample_w / sample_w.mean().clamp_min(1e-6)
+    return obs, acts, sample_w
 
 
 def _eval(model: torch.nn.Module, dl: DataLoader, device: torch.device) -> dict:
     model.eval()
-    ce = nn.CrossEntropyLoss()
+    ce = nn.CrossEntropyLoss(reduction="none")
     losses, correct, total = [], 0, 0
     with torch.no_grad():
-        for xb, yb in dl:
+        for xb, yb, sw in dl:
             xb = xb.to(device)
             yb = yb.to(device)
+            sw = sw.to(device)
             logits = model(xb)
-            loss = ce(logits, yb)
+            loss = (ce(logits, yb) * sw).mean()
             losses.append(float(loss.item()))
             pred = logits.argmax(dim=-1)
             correct += int((pred == yb).sum().item())
@@ -70,39 +94,49 @@ def main() -> int:
     ap.add_argument("--traces", required=True)
     ap.add_argument("--val_traces", default=None)
     ap.add_argument("--out", default="checkpoints/policy_il.pt")
-    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--policy_type", choices=["mlp", "mlp_residual", "gru_policy"], default="mlp")
+    ap.add_argument("--policy_type", choices=["mlp", "mlp_residual", "gru_policy"], default="mlp_residual")
     ap.add_argument("--hidden_dim", type=int, default=128)
     ap.add_argument("--num_layers", type=int, default=2)
-    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--history_len", type=int, default=1)
     ap.add_argument("--use_action_weights", action="store_true")
     ap.add_argument("--terminal_action_boost", type=float, default=1.0)
     ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
+    ap.add_argument("--auto_val_ratio", type=float, default=0.1)
     args = ap.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    x_train, y_train = _load_xy(args.traces, min_score=args.filter_min_trajectory_score)
-    obs_dim = int(x_train.shape[1])
     act_dim = len(Action)
 
-    if int(y_train.max().item()) >= act_dim or int(y_train.min().item()) < 0:
-        raise ValueError(f"Trace actions must be within [0, {act_dim - 1}], got min={int(y_train.min().item())}, max={int(y_train.max().item())}")
+    train_rows = _load_rows(args.traces, min_score=args.filter_min_trajectory_score)
+    x_all, y_all, w_all = _rows_to_tensors(train_rows, act_dim=act_dim)
+    obs_dim = int(x_all.shape[1])
 
-    train_ds = TensorDataset(x_train, y_train)
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-
-    val_dl = None
     if args.val_traces:
-        x_val, y_val = _load_xy(args.val_traces)
+        val_rows = _load_rows(args.val_traces)
+        x_train, y_train, w_train = x_all, y_all, w_all
+        x_val, y_val, w_val = _rows_to_tensors(val_rows, act_dim=act_dim)
         if int(x_val.shape[1]) != obs_dim:
             raise ValueError(f"val_traces obs_dim={int(x_val.shape[1])} does not match train obs_dim={obs_dim}")
-        val_dl = DataLoader(TensorDataset(x_val, y_val), batch_size=args.batch_size, shuffle=False)
+        train_ds = TensorDataset(x_train, y_train, w_train)
+        val_ds = TensorDataset(x_val, y_val, w_val)
+    else:
+        full_ds = TensorDataset(x_all, y_all, w_all)
+        if len(full_ds) >= 10 and args.auto_val_ratio > 0:
+            val_size = max(1, int(round(len(full_ds) * args.auto_val_ratio)))
+            train_size = len(full_ds) - val_size
+            gen = torch.Generator().manual_seed(args.seed)
+            train_ds, val_ds = random_split(full_ds, [train_size, val_size], generator=gen)
+        else:
+            train_ds, val_ds = full_ds, None
+
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False) if val_ds is not None else None
 
     cfg = PolicyConfig(
         policy_type=args.policy_type,
@@ -139,27 +173,52 @@ def main() -> int:
         loss_fn = nn.CrossEntropyLoss()
 
     metrics = []
+    best_metric = float("-inf")
+    best_state = None
+
     for epoch in range(1, args.epochs + 1):
         model.train()
-        losses = []
-        for xb, yb in train_dl:
+        train_losses, train_correct, train_total = [], 0, 0
+
+        for xb, yb, sw in train_dl:
             xb = xb.to(device)
             yb = yb.to(device)
+            sw = sw.to(device)
+
             logits = model(xb)
-            loss = loss_fn(logits, yb)
+            per_ex = ce(logits, yb)
+            loss = (per_ex * sw).mean()
+
             opt.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
-            losses.append(float(loss.item()))
+
+            train_losses.append(float(loss.item()))
+            pred = logits.argmax(dim=-1)
+            train_correct += int((pred == yb).sum().item())
+            train_total += int(yb.numel())
 
         rec = {
             "epoch": epoch,
-            "train_loss": float(np.mean(losses) if losses else 0.0),
+            "train_loss": float(np.mean(train_losses) if train_losses else 0.0),
+            "train_acc": float(train_correct / max(1, train_total)),
         }
+        score_for_selection = rec["train_acc"]
+
         if val_dl is not None:
             val_metrics = _eval(model, val_dl, device)
             rec["val_loss"] = val_metrics["loss"]
             rec["val_acc"] = val_metrics["acc"]
+            score_for_selection = rec["val_acc"]
+
+        if score_for_selection > best_metric:
+            best_metric = score_for_selection
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            rec["is_best"] = True
+        else:
+            rec["is_best"] = False
+
         metrics.append(rec)
         print(json.dumps(rec))
 
@@ -195,7 +254,10 @@ def main() -> int:
     torch.save(ckpt, out)
     out.with_suffix(".metrics.jsonl").write_text("\n".join(json.dumps(m) for m in metrics) + "\n", encoding="utf-8")
     out.with_suffix(".config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
-    print(f"Saved {out}")
+
+    print(f"Saved last checkpoint to {out}")
+    if best_state is not None:
+        print(f"Saved best checkpoint to {best_out}")
     return 0
 
 
