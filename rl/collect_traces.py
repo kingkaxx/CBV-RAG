@@ -56,6 +56,10 @@ def _action_sequence(log: Dict) -> List[int]:
 
 
 def _explicit_early_stop(log: Dict) -> bool:
+    if "explicit_stop_used" in log:
+        return bool(log.get("explicit_stop_used", False))
+
+    # Backward-compatible fallback for older logs.
     steps = log.get("steps", [])
     if not steps:
         return False
@@ -82,6 +86,36 @@ def _behavior_signature(cand: Dict) -> str:
     )
 
 
+def _last_action_is(cand: Dict, action: Action) -> bool:
+    seq = cand.get("action_sequence", [])
+    return bool(seq) and int(seq[-1]) == int(action)
+
+
+def _is_successful_explicit_stop(cand: Dict) -> bool:
+    if not cand.get("success", False):
+        return False
+    return _last_action_is(cand, Action.STOP_AND_ANSWER) or _last_action_is(cand, Action.ANSWER_DIRECT)
+
+
+def _is_short_successful_stop_bucket(cand: Dict) -> bool:
+    # keep compact successful trajectories that terminate explicitly soon after useful context setup
+    if not _is_successful_explicit_stop(cand):
+        return False
+    if not cand.get("had_selected_evidence", False):
+        return False
+    seq = cand.get("action_sequence", [])
+    if len(seq) <= 3:
+        return True
+    return len(seq) <= 4 and int(Action.VERIFY_CHEAP) in seq
+
+
+def _pick_shortest_successful_terminal(pool: List[Dict], action: Action) -> Dict | None:
+    matches = [c for c in pool if c.get("success", False) and _last_action_is(c, action)]
+    if not matches:
+        return None
+    return min(matches, key=lambda c: (c.get("steps", 10**9), c.get("tokens", 10**9), -c.get("trajectory_score", 0.0)))
+
+
 def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success: bool) -> List[Dict]:
     if not cands:
         return []
@@ -94,31 +128,56 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
 
     sorted_by_score = sorted(pool, key=lambda c: (c["trajectory_score"], c["f1"], -c["tokens"]), reverse=True)
     sorted_by_short = sorted(pool, key=lambda c: (c["steps"], c["tokens"], -c["trajectory_score"]))
-    sorted_by_branch = sorted(pool, key=lambda c: (c["num_branches"], c["trajectory_score"]), reverse=True)
+    branch_pool = successful if successful else pool
+    sorted_by_branch = sorted(branch_pool, key=lambda c: (c["num_branches"], c["trajectory_score"]), reverse=True)
 
     best = sorted_by_score[0]
     shortest = sorted_by_short[0]
     chosen: List[Dict] = []
 
-    if keep_n <= 1:
-        close_in_score = (best["trajectory_score"] - shortest["trajectory_score"]) <= 0.4
-        chosen = [shortest if close_in_score else best]
+    def _add_if_new(c: Dict | None) -> None:
+        if c is None:
+            return
+        if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
+            chosen.append(c)
+
+    # Retention bucket: preserve short successful explicit-stop traces even if a longer trace scores slightly higher.
+    short_successful_stops = [c for c in pool if _is_short_successful_stop_bucket(c)]
+    for c in sorted(short_successful_stops, key=lambda x: (x["steps"], x["tokens"], -x["trajectory_score"])):
+        if len(chosen) >= keep_n:
+            break
+        _add_if_new(c)
+
+    # Keep at least one shortest successful terminal trace when available.
+    stop_shortest = _pick_shortest_successful_terminal(pool, Action.STOP_AND_ANSWER)
+    answer_direct_shortest = _pick_shortest_successful_terminal(pool, Action.ANSWER_DIRECT)
+    if stop_shortest is not None and answer_direct_shortest is not None:
+        preferred = stop_shortest if (stop_shortest["steps"], stop_shortest["tokens"]) <= (answer_direct_shortest["steps"], answer_direct_shortest["tokens"]) else answer_direct_shortest
+        _add_if_new(preferred)
     else:
-        chosen.append(shortest)
-        if _behavior_signature(best) != _behavior_signature(shortest):
-            chosen.append(best)
-        if keep_n >= 3:
-            for c in sorted_by_branch:
-                if c["num_branches"] <= 1:
-                    continue
-                if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
-                    chosen.append(c)
-                    break
-        for c in sorted_by_score:
+        _add_if_new(stop_shortest or answer_direct_shortest)
+
+    if keep_n <= 1:
+        if chosen:
+            return chosen[:1]
+        close_in_score = (best["trajectory_score"] - shortest["trajectory_score"]) <= 0.4
+        return [shortest if close_in_score else best]
+
+    _add_if_new(shortest)
+    _add_if_new(best)
+
+    if keep_n >= 3:
+        for c in sorted_by_branch:
+            if c["num_branches"] <= 1:
+                continue
             if len(chosen) >= keep_n:
                 break
-            if all(_behavior_signature(c) != _behavior_signature(x) for x in chosen):
-                chosen.append(c)
+            _add_if_new(c)
+
+    for c in sorted_by_score:
+        if len(chosen) >= keep_n:
+            break
+        _add_if_new(c)
 
     return chosen[: max(1, keep_n)]
 
@@ -280,9 +339,30 @@ def main() -> int:
                     cfg=score_cfg,
                 )
 
-                # stronger preference for efficient successful traces with nontrivial but not excessive branching
+                final_state = log.get("state", {}) or {}
+                had_selected_evidence = len(final_state.get("selected_evidence_ids", []) or []) > 0
+                final_action = action_sequence[-1] if action_sequence else -1
+                explicit_terminal = final_action in {int(Action.STOP_AND_ANSWER), int(Action.ANSWER_DIRECT)}
+                verify_steps = sum(1 for a in action_sequence if a == int(Action.VERIFY_CHEAP))
+                verify_no_improvement = sum(
+                    1
+                    for s in (log.get("steps", []) or [])
+                    if isinstance(s, dict)
+                    and int(s.get("action", -1)) == int(Action.VERIFY_CHEAP)
+                    and int(s.get("verification_status_changed", 0)) == 0
+                )
+
+                # stronger preference for efficient, explicit, successful terminations after context selection
                 if success:
                     trajectory_score += 0.25 * (1.0 if explicit_early_stop else 0.0)
+                    if explicit_terminal and had_selected_evidence:
+                        trajectory_score += 0.45
+                        trajectory_score += 0.10 * (1.0 if final_action == int(Action.STOP_AND_ANSWER) else 0.0)
+                        trajectory_score -= 0.07 * max(0, verify_steps - 1)
+
+                # penalize repeated VERIFY_CHEAP especially when status does not improve
+                trajectory_score -= 0.04 * max(0, verify_steps - 1)
+                trajectory_score -= 0.12 * float(verify_no_improvement)
                 trajectory_score -= 0.04 * max(0, episode_steps - 5)
                 trajectory_score -= 0.06 * max(0, num_branches - 2)
 
@@ -309,6 +389,12 @@ def main() -> int:
                         "oracle_name": oracle_name,
                         "case_profile": case_profile,
                         "fallback_stop_was_used": bool(log.get("fallback_stop_was_used", False)),
+                        "explicit_stop_used": bool(log.get("explicit_stop_used", False)),
+                        "forced_stop_used": bool(log.get("forced_stop_used", False)),
+                        "had_selected_evidence": had_selected_evidence,
+                        "verify_steps": verify_steps,
+                        "verify_no_improvement": verify_no_improvement,
+                        "final_action": final_action,
                         "action_sequence": action_sequence,
                     }
                 )
@@ -338,6 +424,8 @@ def main() -> int:
                 trace = cand["controller"].trace
                 for t, tr in enumerate(trace):
                     info = tr.get("info", {}) if isinstance(tr, dict) else {}
+                    if not isinstance(info, dict):
+                        info = {}
                     row = {
                         "qid": qid,
                         "episode_id": f"{qid}::{cand['cand_idx']}",
@@ -351,7 +439,8 @@ def main() -> int:
                         "done": t == len(trace) - 1,
                         "success": bool(cand["success"]),
                         "terminal_correct": bool(cand["success"]),
-                        "info": cand["log"].get("steps", []),
+                        "info": info,
+                        "episode_trace": cand["log"].get("steps", []),
                         "episode_total_reward": cand["episode_total_reward"],
                         "episode_total_tokens": cand["tokens"],
                         "episode_total_retrieval_calls": cand["retrieval_calls"],
@@ -359,6 +448,8 @@ def main() -> int:
                         "episode_total_llm_calls": cand["llm_calls"],
                         "episode_num_branches": cand["num_branches"],
                         "episode_final_fallback_stop": cand["fallback_stop_was_used"],
+                        "episode_final_explicit_stop": cand.get("explicit_stop_used", False),
+                        "episode_final_forced_stop": cand.get("forced_stop_used", False),
                         "explicit_early_stop": cand["explicit_early_stop"],
                         "action_sequence": cand["action_sequence"],
                         # richer optional schema

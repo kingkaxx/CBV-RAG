@@ -161,8 +161,15 @@ Outputs:
 ### Step 3: Train IL policy (architecture configurable)
 
 ```bash
-python rl/train_il.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --out checkpoints/policy_il.pt   --policy_type mlp   --hidden_dim 128   --num_layers 2   --dropout 0.0   --history_len 1   --seed 42
+python rl/train_il.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --out checkpoints/policy_il.pt   --policy_type mlp   --hidden_dim 128   --num_layers 2   --dropout 0.0   --history_len 1   --use_action_weights   --seed 42
 ```
+
+
+IL checkpoints now store runtime-safety metadata used by the learned controller loader:
+- `state_dict`, `obs_dim`, `act_dim`, `arch`
+- `feature_schema_version`, `action_enum_version`, `action_names`
+
+Loading fails fast if feature/action metadata is incompatible with the current runtime.
 
 ### Step 4: Train offline RL policy (modular objectives)
 

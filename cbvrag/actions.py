@@ -1,6 +1,9 @@
 from enum import IntEnum
 
 
+ACTION_ENUM_VERSION = "cbvrag_action_enum_v1"
+
+
 class Action(IntEnum):
     ANSWER_DIRECT = 0
     RETRIEVE_MORE_SMALL = 1
@@ -13,3 +16,7 @@ class Action(IntEnum):
     MERGE_BRANCHES = 8
     SUMMARIZE_STATE = 9
     STOP_AND_ANSWER = 10
+
+
+def action_names() -> list[str]:
+    return [a.name for a in Action]

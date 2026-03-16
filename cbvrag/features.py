@@ -5,6 +5,9 @@ from typing import List
 from cbvrag.state import EpisodeState
 
 
+FEATURE_SCHEMA_VERSION = "cbvrag_features_v2"
+
+
 def _one_hot_verification(status: str) -> List[float]:
     vals = ["unknown", "supported", "contradicted"]
     return [1.0 if status == v else 0.0 for v in vals]
@@ -109,3 +112,7 @@ def build_features(state: EpisodeState) -> List[float]:
     )
     vec.extend(last_action_onehot)
     return [float(v) for v in vec]
+
+
+def feature_schema_version() -> str:
+    return FEATURE_SCHEMA_VERSION

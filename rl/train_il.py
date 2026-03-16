@@ -5,12 +5,15 @@ import json
 import random
 import subprocess
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from cbvrag.actions import ACTION_ENUM_VERSION, Action, action_names
+from cbvrag.features import FEATURE_SCHEMA_VERSION
 from rl.policy import PolicyConfig, build_policy
 
 
@@ -27,9 +30,45 @@ def get_git_commit() -> str:
         return "unknown"
 
 
+def _load_xy(path: str, min_score: float | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    obs, acts = [], []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            if min_score is not None and float(row.get("trajectory_score", 0.0)) < min_score:
+                continue
+            obs.append(row["obs"])
+            acts.append(int(row["action"]))
+    if not obs:
+        raise ValueError(f"No traces loaded from {path}. Adjust filters or input file.")
+    return torch.tensor(obs, dtype=torch.float32), torch.tensor(acts, dtype=torch.long)
+
+
+def _eval(model: torch.nn.Module, dl: DataLoader, device: torch.device) -> dict:
+    model.eval()
+    ce = nn.CrossEntropyLoss()
+    losses, correct, total = [], 0, 0
+    with torch.no_grad():
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = ce(logits, yb)
+            losses.append(float(loss.item()))
+            pred = logits.argmax(dim=-1)
+            correct += int((pred == yb).sum().item())
+            total += int(yb.numel())
+    return {
+        "loss": float(np.mean(losses) if losses else 0.0),
+        "acc": float(correct / max(1, total)),
+        "n": total,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces", required=True)
+    ap.add_argument("--val_traces", default=None)
     ap.add_argument("--out", default="checkpoints/policy_il.pt")
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch_size", type=int, default=64)
@@ -45,57 +84,68 @@ def main() -> int:
     args = ap.parse_args()
 
     set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    obs, acts = [], []
-    with open(args.traces, "r", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-            if args.filter_min_trajectory_score is not None and float(row.get("trajectory_score", 0.0)) < args.filter_min_trajectory_score:
-                continue
-            obs.append(row["obs"])
-            acts.append(row["action"])
+    x_train, y_train = _load_xy(args.traces, min_score=args.filter_min_trajectory_score)
+    obs_dim = int(x_train.shape[1])
+    act_dim = len(Action)
 
-    if not obs:
-        raise ValueError("No traces left after filtering; lower --filter_min_trajectory_score or check input")
+    if int(y_train.max().item()) >= act_dim or int(y_train.min().item()) < 0:
+        raise ValueError(f"Trace actions must be within [0, {act_dim - 1}], got min={int(y_train.min().item())}, max={int(y_train.max().item())}")
 
-    x = torch.tensor(obs, dtype=torch.float32)
-    y = torch.tensor(acts, dtype=torch.long)
-    ds = TensorDataset(x, y)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
+    train_ds = TensorDataset(x_train, y_train)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
 
-    act_dim = int(y.max().item()) + 1 if y.numel() else 11
+    val_dl = None
+    if args.val_traces:
+        x_val, y_val = _load_xy(args.val_traces)
+        if int(x_val.shape[1]) != obs_dim:
+            raise ValueError(f"val_traces obs_dim={int(x_val.shape[1])} does not match train obs_dim={obs_dim}")
+        val_dl = DataLoader(TensorDataset(x_val, y_val), batch_size=args.batch_size, shuffle=False)
+
     cfg = PolicyConfig(
         policy_type=args.policy_type,
-        obs_dim=x.shape[1],
+        obs_dim=obs_dim,
         act_dim=act_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
         history_len=args.history_len,
     )
-    model = build_policy(cfg)
+    model = build_policy(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
     if args.use_action_weights:
-        counts = torch.bincount(y, minlength=act_dim).float()
+        counts = torch.bincount(y_train, minlength=act_dim).float()
         weights = torch.where(counts > 0, 1.0 / counts, torch.zeros_like(counts))
         if weights.sum() > 0:
             weights = weights / weights.mean().clamp_min(1e-6)
-        loss_fn = nn.CrossEntropyLoss(weight=weights)
+        loss_fn = nn.CrossEntropyLoss(weight=weights.to(device))
     else:
         loss_fn = nn.CrossEntropyLoss()
 
     metrics = []
-    model.train()
     for epoch in range(1, args.epochs + 1):
+        model.train()
         losses = []
-        for xb, yb in dl:
+        for xb, yb in train_dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
             logits = model(xb)
             loss = loss_fn(logits, yb)
             opt.zero_grad()
             loss.backward()
             opt.step()
             losses.append(float(loss.item()))
-        rec = {"epoch": epoch, "train_loss": float(np.mean(losses) if losses else 0.0)}
+
+        rec = {
+            "epoch": epoch,
+            "train_loss": float(np.mean(losses) if losses else 0.0),
+        }
+        if val_dl is not None:
+            val_metrics = _eval(model, val_dl, device)
+            rec["val_loss"] = val_metrics["loss"]
+            rec["val_acc"] = val_metrics["acc"]
         metrics.append(rec)
         print(json.dumps(rec))
 
@@ -103,7 +153,7 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
         "state_dict": model.state_dict(),
-        "obs_dim": x.shape[1],
+        "obs_dim": obs_dim,
         "act_dim": act_dim,
         "arch": {
             "policy_type": args.policy_type,
@@ -112,10 +162,20 @@ def main() -> int:
             "dropout": args.dropout,
             "history_len": args.history_len,
         },
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "action_enum_version": ACTION_ENUM_VERSION,
+        "action_names": action_names(),
         "dataset": args.traces,
+        "val_dataset": args.val_traces,
         "seed": args.seed,
         "git_commit": get_git_commit(),
-        "hparams": {"epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr},
+        "hparams": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "use_action_weights": bool(args.use_action_weights),
+            "filter_min_trajectory_score": args.filter_min_trajectory_score,
+        },
     }
     torch.save(ckpt, out)
     out.with_suffix(".metrics.jsonl").write_text("\n".join(json.dumps(m) for m in metrics) + "\n", encoding="utf-8")
