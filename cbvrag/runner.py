@@ -170,9 +170,15 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         except Exception:
             return False
 
-    def _append_log(action: Action, costs: Dict[str, Any], selected_evidence_changed: int,
-                    evidence_pool_changed: int, branch_count_changed: int,
-                    verification_status_changed: int, made_progress: bool) -> None:
+    def _append_log(
+        action: Action,
+        costs: Dict[str, Any],
+        selected_evidence_changed: int,
+        evidence_pool_changed: int,
+        branch_count_changed: int,
+        verification_status_changed: int,
+        made_progress: bool,
+    ) -> None:
         state.metrics["second_last_action"] = int(state.metrics.get("last_action", -1))
         state.metrics["last_action"] = int(action)
         state.metrics["selected_evidence_changed"] = selected_evidence_changed
@@ -271,9 +277,13 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         if no_progress_streak >= 1 and last_action == second_last_action and last_action in no_op_repeat_actions:
             action_mask[last_action] = False
 
-        if retrieval_calls > 0 and selected_nonempty:
-            action_mask[int(Action.STOP_AND_ANSWER)] = True
-            action_mask[int(Action.ANSWER_DIRECT)] = True
+        # Only allow terminal actions after stronger evidence of readiness:
+        # either we have retrieved at least twice, or verification already supports stopping.
+        can_stop_now = selected_nonempty and (
+            retrieval_calls >= 2 or state.verification_status == "supported"
+        )
+        action_mask[int(Action.STOP_AND_ANSWER)] = can_stop_now
+        action_mask[int(Action.ANSWER_DIRECT)] = can_stop_now
 
         try:
             action_idx = controller.act(obs, state, action_mask=action_mask)
@@ -287,12 +297,20 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         if not action_mask[int(action)]:
             action_was_forced = True
             selected_nonempty = len(state.selected_evidence_ids) > 0
-            if action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
+            pool_nonempty = len(state.evidence_pool) > 0
+            retrieval_calls_now = int(state.metrics.get("retrieval_calls", 0))
+
+            # Prefer deeper retrieval before stopping when we only retrieved once.
+            if retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_SMALL)]:
+                action = Action.RETRIEVE_MORE_SMALL
+            elif retrieval_calls_now < 2 and action_mask[int(Action.RETRIEVE_MORE_LARGE)]:
+                action = Action.RETRIEVE_MORE_LARGE
+            elif action_mask[int(Action.VERIFY_CHEAP)] and pool_nonempty:
+                action = Action.VERIFY_CHEAP
+            elif action_mask[int(Action.STOP_AND_ANSWER)] and selected_nonempty:
                 action = Action.STOP_AND_ANSWER
             elif action_mask[int(Action.ANSWER_DIRECT)] and selected_nonempty:
                 action = Action.ANSWER_DIRECT
-            elif action_mask[int(Action.VERIFY_CHEAP)] and len(state.evidence_pool) > 0:
-                action = Action.VERIFY_CHEAP
             else:
                 action = Action(next(i for i, ok in enumerate(action_mask) if ok))
 
@@ -371,7 +389,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
 
         if (
             int(state.metrics.get("no_progress_streak", 0)) >= 1
-            and int(state.metrics.get("retrieval_calls", 0)) > 0
+            and int(state.metrics.get("retrieval_calls", 0)) >= 2
             and len(state.selected_evidence_ids) > 0
             and state.step < budgets["max_steps"]
         ):
@@ -393,5 +411,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
     out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
     out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
-    out["state"]["metrics"]["explicit_terminal_action"] = int(explicit_terminal_action) if explicit_terminal_action is not None else -1
+    out["state"]["metrics"]["explicit_terminal_action"] = (
+        int(explicit_terminal_action) if explicit_terminal_action is not None else -1
+    )
     return state.final_answer, out
