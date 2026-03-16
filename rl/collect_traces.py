@@ -97,7 +97,7 @@ def main() -> int:
                 "name_or_path",
                 models["llm_model"].config._name_or_path,
             ),
-            device="cpu",
+            device="cuda : 0",
         ),
         "retrieve": RetrieverTool(retriever),
         "rerank": CrossEncoderReranker(),
