@@ -148,6 +148,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     logs = []
     fallback_stop_was_used = False
     explicit_stop_used = False
+    forced_stop_used = False
 
     def _should_debug(qid_value: str) -> bool:
         try:
@@ -278,11 +279,15 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             action in (Action.STOP_AND_ANSWER, Action.ANSWER_DIRECT)
             or state.metrics["retrieval_calls"] >= budgets["max_retrieval_calls"]
         ):
-            if action in (Action.STOP_AND_ANSWER, Action.ANSWER_DIRECT) and not action_was_forced:
-                explicit_stop_used = True
+            if action in (Action.STOP_AND_ANSWER, Action.ANSWER_DIRECT):
+                if action_was_forced:
+                    forced_stop_used = True
+                else:
+                    explicit_stop_used = True
             if not state.final_answer:
                 execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
                 fallback_stop_was_used = True
+                forced_stop_used = True
             break
 
         if (
@@ -293,20 +298,24 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         ):
             execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
             fallback_stop_was_used = True
+            forced_stop_used = True
             break
 
     # Always force a final answer if rollout exhausted max_steps without explicit answer.
     if not state.final_answer:
         execute_action(state, Action.STOP_AND_ANSWER, controller, tools)
         fallback_stop_was_used = True
+        forced_stop_used = True
 
     out = {
         "state": asdict(state),
         "steps": logs,
         "fallback_stop_was_used": fallback_stop_was_used,
         "explicit_stop_used": explicit_stop_used,
+        "forced_stop_used": forced_stop_used,
     }
     out["state"].setdefault("metrics", {})
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
     out["state"]["metrics"]["explicit_stop_used"] = int(explicit_stop_used)
+    out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
     return state.final_answer, out

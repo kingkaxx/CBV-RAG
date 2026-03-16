@@ -128,7 +128,8 @@ def _pick_diverse_candidates(cands: List[Dict], keep_n: int, allow_near_success:
 
     sorted_by_score = sorted(pool, key=lambda c: (c["trajectory_score"], c["f1"], -c["tokens"]), reverse=True)
     sorted_by_short = sorted(pool, key=lambda c: (c["steps"], c["tokens"], -c["trajectory_score"]))
-    sorted_by_branch = sorted(pool, key=lambda c: (c["num_branches"], c["trajectory_score"]), reverse=True)
+    branch_pool = successful if successful else pool
+    sorted_by_branch = sorted(branch_pool, key=lambda c: (c["num_branches"], c["trajectory_score"]), reverse=True)
 
     best = sorted_by_score[0]
     shortest = sorted_by_short[0]
@@ -389,6 +390,7 @@ def main() -> int:
                         "case_profile": case_profile,
                         "fallback_stop_was_used": bool(log.get("fallback_stop_was_used", False)),
                         "explicit_stop_used": bool(log.get("explicit_stop_used", False)),
+                        "forced_stop_used": bool(log.get("forced_stop_used", False)),
                         "had_selected_evidence": had_selected_evidence,
                         "verify_steps": verify_steps,
                         "verify_no_improvement": verify_no_improvement,
@@ -422,6 +424,8 @@ def main() -> int:
                 trace = cand["controller"].trace
                 for t, tr in enumerate(trace):
                     info = tr.get("info", {}) if isinstance(tr, dict) else {}
+                    if not isinstance(info, dict):
+                        info = {}
                     row = {
                         "qid": qid,
                         "episode_id": f"{qid}::{cand['cand_idx']}",
@@ -435,7 +439,8 @@ def main() -> int:
                         "done": t == len(trace) - 1,
                         "success": bool(cand["success"]),
                         "terminal_correct": bool(cand["success"]),
-                        "info": cand["log"].get("steps", []),
+                        "info": info,
+                        "episode_trace": cand["log"].get("steps", []),
                         "episode_total_reward": cand["episode_total_reward"],
                         "episode_total_tokens": cand["tokens"],
                         "episode_total_retrieval_calls": cand["retrieval_calls"],
@@ -444,6 +449,7 @@ def main() -> int:
                         "episode_num_branches": cand["num_branches"],
                         "episode_final_fallback_stop": cand["fallback_stop_was_used"],
                         "episode_final_explicit_stop": cand.get("explicit_stop_used", False),
+                        "episode_final_forced_stop": cand.get("forced_stop_used", False),
                         "explicit_early_stop": cand["explicit_early_stop"],
                         "action_sequence": cand["action_sequence"],
                         # richer optional schema

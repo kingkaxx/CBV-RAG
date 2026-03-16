@@ -6,7 +6,46 @@ from typing import Any, Dict, Iterable, List, Optional
 import torch
 
 from rl.policy import build_policy, policy_config_from_checkpoint
-from cbvrag.actions import Action
+from cbvrag.actions import ACTION_ENUM_VERSION, Action, action_names
+from cbvrag.features import FEATURE_SCHEMA_VERSION
+
+
+
+def _validate_checkpoint_compat(ckpt: Dict[str, Any], cfg: Any) -> None:
+    expected_act_dim = len(Action)
+    if int(cfg.act_dim) != expected_act_dim:
+        raise ValueError(
+            f"Policy checkpoint act_dim={cfg.act_dim} does not match Action enum size={expected_act_dim}."
+        )
+
+    ckpt_schema = ckpt.get("feature_schema_version")
+    if ckpt_schema != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            "Feature schema mismatch: "
+            f"checkpoint has {ckpt_schema!r}, runtime expects {FEATURE_SCHEMA_VERSION!r}."
+        )
+
+    ckpt_action_enum_version = ckpt.get("action_enum_version")
+    if ckpt_action_enum_version != ACTION_ENUM_VERSION:
+        raise ValueError(
+            "Action enum version mismatch: "
+            f"checkpoint has {ckpt_action_enum_version!r}, runtime expects {ACTION_ENUM_VERSION!r}."
+        )
+
+    ckpt_action_names = ckpt.get("action_names")
+    current_names = action_names()
+    if not isinstance(ckpt_action_names, list):
+        raise ValueError("Checkpoint missing required action_names metadata.")
+    if len(ckpt_action_names) != len(current_names):
+        raise ValueError(
+            "Action-name length mismatch: "
+            f"checkpoint has {len(ckpt_action_names)} names, runtime expects {len(current_names)}."
+        )
+    if list(ckpt_action_names) != current_names:
+        raise ValueError(
+            "Action-name order mismatch between checkpoint and current Action enum. "
+            f"checkpoint={ckpt_action_names}, runtime={current_names}"
+        )
 
 
 class LearnedController:
@@ -17,11 +56,7 @@ class LearnedController:
         self.trace: List[Dict[str, Any]] = []
         self.ckpt = torch.load(policy_ckpt, map_location="cpu")
         cfg = policy_config_from_checkpoint(self.ckpt)
-        expected_act_dim = len(Action)
-        if int(cfg.act_dim) != expected_act_dim:
-            raise ValueError(
-                f"Policy checkpoint act_dim={cfg.act_dim} does not match Action enum size={expected_act_dim}."
-            )
+        _validate_checkpoint_compat(self.ckpt, cfg)
         self.history_len = max(1, cfg.history_len)
         self.expected_obs_dim = int(cfg.obs_dim)
         self._debug_print_limit = 8
