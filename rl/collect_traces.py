@@ -407,7 +407,7 @@ def main() -> int:
                         "final_action": final_action,
                         "action_sequence": action_sequence,
                         "cluster_stats": dict(state_metrics.get("cluster_stats", {})) if isinstance(state_metrics.get("cluster_stats", {}), dict) else {},
-                        "specificity_stats": dict(state_metrics.get("specificity_stats", {})) if isinstance(state_metrics.get("specificity_stats", {}), dict) else {},
+                        "specificity_summary": dict(state_metrics.get("specificity_summary", {})) if isinstance(state_metrics.get("specificity_summary", {}), dict) else {},
                     }
                 )
 
@@ -502,7 +502,7 @@ def main() -> int:
                         "candidate_rank": rank,
                         "trajectory_score": cand["trajectory_score"],
                         "cluster_stats": cand.get("cluster_stats", {}),
-                        "specificity_stats": cand.get("specificity_stats", {}),
+                        "specificity_summary": cand.get("specificity_summary", {}),
                         "state_features": obs,
                         "action_reason": info.get("action_reason", ""),
                         "tokens_before": None,

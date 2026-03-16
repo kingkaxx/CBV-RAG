@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import List
 
 from cbvrag.actions import Action
+from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
+from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.state import EpisodeState
 
 
-FEATURE_SCHEMA_VERSION = "cbvrag_features_v4"
+FEATURE_SCHEMA_VERSION = "cbvrag_features_v5"
 
 
 def _one_hot_verification(status: str) -> List[float]:
@@ -14,8 +16,21 @@ def _one_hot_verification(status: str) -> List[float]:
     return [1.0 if status == v else 0.0 for v in vals]
 
 
-def _safe_div(a: float, b: float) -> float:
-    return float(a) / max(1.0, float(b))
+def _pool_dicts(state: EpisodeState) -> list[dict]:
+    selected = set(state.selected_evidence_ids)
+    return [
+        {
+            "evidence_id": e.evidence_id,
+            "doc_id": e.doc_id,
+            "chunk_id": e.chunk_id,
+            "title": e.title,
+            "rerank_score": float(e.rerank_score),
+            "retriever_score": float(e.retriever_score),
+            "text": e.short_claim,
+            "is_selected": e.evidence_id in selected,
+        }
+        for e in state.evidence_pool.values()
+    ]
 
 
 def build_features(state: EpisodeState) -> List[float]:
@@ -108,7 +123,6 @@ def build_features(state: EpisodeState) -> List[float]:
     view_disagreement_score = float(state.metrics.get("view_disagreement_score", 0.0))
     original_specific_cluster_count = float(state.metrics.get("original_specific_cluster_count", 0.0))
 
-    # existing/core features first (backward-compat ordering)
     vec = [
         step_frac,
         float(pool_count),
@@ -126,7 +140,6 @@ def build_features(state: EpisodeState) -> List[float]:
         retrieval_budget_left,
     ] + _one_hot_verification(state.verification_status)
 
-    # appended richer control features
     selected_frac_of_pool = selected_count / max(1, pool_count)
     branch_frac = active_branches / max_branches
     retrieval_frac = retrieval_calls / max_retrieval
@@ -153,8 +166,8 @@ def build_features(state: EpisodeState) -> List[float]:
     score_std_proxy = abs(best - mean_topk)
     conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
 
-    last_action_norm = (last_action / max(1, len(_one_hot_verification("unknown")) + 8)) if last_action >= 0 else -1.0
-    last_action_onehot = [1.0 if i == last_action else 0.0 for i in range(11)]
+    last_action_norm = (last_action / max(1, len(Action) - 1)) if last_action >= 0 else -1.0
+    last_action_onehot = [1.0 if i == last_action else 0.0 for i in range(len(Action))]
 
     vec.extend(
         [
@@ -211,27 +224,30 @@ def build_features(state: EpisodeState) -> List[float]:
     second_last_action_onehot = [1.0 if i == second_last_action else 0.0 for i in range(act_dim)]
     vec.extend(last_action_onehot)
 
-    # cluster/specificity candidate-aware features (stable append-only ordering)
+    # Phase-1 appended cluster/specificity feature block.
+    pool_items = _pool_dicts(state)
+    clusters = cluster_evidence_items(pool_items)
+    cstats = summarize_cluster_stats(clusters)
+    sstats = score_evidence_specificity(state.question, pool_items).get("summary", {})
+
     vec.extend(
         [
-            num_clusters,
-            largest_cluster_size,
-            largest_cluster_frac,
-            top_cluster_mean_rerank,
-            second_cluster_mean_rerank,
-            cluster_gap,
-            selected_cluster_count,
-            selected_cluster_diversity,
-            selected_same_cluster_frac,
-            evidence_redundancy_proxy,
-            multi_cluster_support_flag,
-            best_specificity_score,
-            mean_specificity_selected,
-            best_counterfactual_resistance,
-            candidate_count_available,
-            candidate_score_gap_top2,
-            view_disagreement_score,
-            original_specific_cluster_count,
+            float(cstats.get("num_clusters", 0)),
+            float(cstats.get("largest_cluster_size", 0)),
+            float(cstats.get("largest_cluster_frac", 0.0)),
+            float(cstats.get("top_cluster_mean_rerank", 0.0)),
+            float(cstats.get("second_cluster_mean_rerank", 0.0)),
+            float(cstats.get("cluster_gap", 0.0)),
+            float(cstats.get("selected_cluster_count", 0)),
+            float(cstats.get("selected_cluster_diversity", 0.0)),
+            float(cstats.get("selected_same_cluster_frac", 0.0)),
+            float(cstats.get("evidence_redundancy_proxy", 0.0)),
+            float(cstats.get("multi_cluster_support_flag", 0.0)),
+            float(sstats.get("best_specificity_score", 0.0)),
+            float(sstats.get("mean_specificity", 0.0)),
+            float(sstats.get("mean_specificity_selected", 0.0)),
+            float(sstats.get("best_support_strength", 0.0)),
+            float(sstats.get("mean_genericity", 0.0)),
         ]
     )
     return [float(v) for v in vec]

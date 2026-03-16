@@ -9,7 +9,7 @@ from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.features import build_features
 from cbvrag.prompts import answer_prompt, counterfactual_prompt, verify_prompt
 from cbvrag.state import Branch, EpisodeState, EvidenceItem
-from tools.select import select_context
+from tools.select import select_context, select_context_cluster_aware
 
 
 def default_budgets() -> Dict[str, int]:
@@ -124,6 +124,78 @@ def _update_cluster_specificity_metrics(state: EpisodeState) -> None:
     )
 
 
+
+
+def _pool_as_dicts(state: EpisodeState) -> list[dict]:
+    selected = set(state.selected_evidence_ids)
+    return [
+        {
+            "evidence_id": e.evidence_id,
+            "doc_id": e.doc_id,
+            "chunk_id": e.chunk_id,
+            "title": e.title,
+            "rerank_score": float(e.rerank_score),
+            "retriever_score": float(e.retriever_score),
+            "text": e.short_claim,
+            "is_selected": e.evidence_id in selected,
+            "branch_id": e.branch_id,
+        }
+        for e in state.evidence_pool.values()
+    ]
+
+
+def _update_cluster_specificity_metrics(state: EpisodeState) -> None:
+    items = _pool_as_dicts(state)
+    clusters = cluster_evidence_items(items)
+    cluster_stats = summarize_cluster_stats(clusters)
+    cluster_map = {}
+    for c in clusters:
+        cid = c.get("cluster_id", "")
+        for eid in c.get("member_ids", []) or []:
+            cluster_map[eid] = cid
+
+    retrieved_by_query = {
+        "original": [dict(it, cluster_id=cluster_map.get(str(it.get("evidence_id", "")), "")) for it in items]
+    }
+    spec = score_evidence_specificity(state.question, retrieved_by_query.get("original", []))
+    spec_summary = dict(spec.get("summary", {})) if isinstance(spec.get("summary", {}), dict) else {}
+    best_spec = float(spec_summary.get("best_specificity_score", 0.0))
+    mean_spec = float(spec_summary.get("mean_specificity", 0.0))
+    mean_sel_spec = float(spec_summary.get("mean_specificity_selected", 0.0))
+    best_support_strength = float(spec_summary.get("best_support_strength", 0.0))
+    mean_genericity = float(spec_summary.get("mean_genericity", 0.0))
+
+    sel_clusters = [cluster_map.get(eid, "") for eid in state.selected_evidence_ids if cluster_map.get(eid, "")]
+    selected_cluster_count = len(set(sel_clusters))
+    same_cluster_frac = 0.0
+    if sel_clusters:
+        same_cluster_frac = max(sel_clusters.count(c) for c in set(sel_clusters)) / max(1, len(sel_clusters))
+
+    state.metrics.update(
+        {
+            **cluster_stats,
+            "selected_cluster_count": float(selected_cluster_count),
+            "selected_cluster_diversity": float(selected_cluster_count / max(1, int(cluster_stats.get("num_clusters", 0) or 1))),
+            "selected_same_cluster_frac": float(same_cluster_frac),
+            "evidence_redundancy_proxy": float(same_cluster_frac),
+            "multi_cluster_support_flag": 1.0 if selected_cluster_count >= 2 else 0.0,
+            "best_specificity_score": float(best_spec),
+            "mean_specificity": float(mean_spec),
+            "mean_specificity_selected": float(mean_sel_spec),
+            "best_support_strength": float(best_support_strength),
+            "mean_genericity": float(mean_genericity),
+            "cluster_stats": cluster_stats,
+            "specificity_summary": {
+                "best_specificity_score": float(best_spec),
+                "mean_specificity": float(mean_spec),
+                "mean_specificity_selected": float(mean_sel_spec),
+                "best_support_strength": float(best_support_strength),
+                "mean_genericity": float(mean_genericity),
+            },
+        }
+    )
+
+
 def execute_action(state: EpisodeState, action: Action, controller: Any, tools: Dict[str, Any]) -> Dict[str, Any]:
     step_costs = {"tokens_used_this_step": 0, "retrieval_calls_this_step": 0, "new_branch_created": 0}
     retriever = tools["retrieve"]
@@ -164,13 +236,23 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
             }
             for e in state.evidence_pool.values()
         ]
-        selected = select_context(
-            state.question,
-            pool,
+        clusters = cluster_evidence_items(pool)
+        selected = select_context_cluster_aware(
+            question=state.question,
+            pool=pool,
             tokenizer=llm.tokenizer,
             max_chunks=state.budgets["max_context_chunks"],
             max_tokens=state.budgets["max_context_tokens"],
+            cluster_info=clusters,
         )
+        if not selected:
+            selected = select_context(
+                state.question,
+                pool,
+                tokenizer=llm.tokenizer,
+                max_chunks=state.budgets["max_context_chunks"],
+                max_tokens=state.budgets["max_context_tokens"],
+            )
         state.selected_evidence_ids = [s["evidence_id"] for s in selected]
         _update_cluster_specificity_metrics(state)
 
@@ -428,6 +510,10 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
                 "branch_count_changed": branch_count_changed,
                 "verification_status_changed": verification_status_changed,
                 "no_progress_streak": int(state.metrics.get("no_progress_streak", 0)),
+                "num_clusters": float(state.metrics.get("num_clusters", 0.0)),
+                "largest_cluster_frac": float(state.metrics.get("largest_cluster_frac", 0.0)),
+                "best_specificity_score": float(state.metrics.get("best_specificity_score", 0.0)),
+                "mean_specificity_selected": float(state.metrics.get("mean_specificity_selected", 0.0)),
             }
         )
 

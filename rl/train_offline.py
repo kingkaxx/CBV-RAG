@@ -30,14 +30,34 @@ def main() -> int:
     obs = torch.tensor([r["obs"] for r in rows], dtype=torch.float32)
     act = torch.tensor([int(r["action"]) for r in rows], dtype=torch.long)
 
-    # Reward shaping for offline preference weighting.
-    rew = []
-    for r in rows:
-        v = float(r.get("reward", 0.0))
-        v += 0.75 * float(bool(r.get("terminal_correct", False)))
-        v += 0.25 * float(r.get("trajectory_score", 0.0))
-        rew.append(v)
-    rew = torch.tensor(rew, dtype=torch.float32)
+    reward_cfg = RewardConfig(
+        correctness_reward=args.correctness_reward,
+        token_penalty=args.token_penalty,
+        retrieval_penalty=args.retrieval_penalty,
+        branch_penalty=args.branch_penalty,
+        verify_bonus=args.verify_bonus,
+        early_stop_bonus=args.early_stop_bonus,
+        support_hit_reward=args.support_hit_reward,
+        support_full_reward=args.support_full_reward,
+        support_rank_reward=args.support_rank_reward,
+        discrimination_reward=args.discrimination_reward,
+        contradiction_bonus=args.contradiction_bonus,
+        use_support_reward=not args.disable_support_reward,
+        use_verification_reward=not args.disable_verification_reward,
+        use_efficiency_penalty=not args.disable_efficiency_penalty,
+        use_counterfactual_discrimination_reward=not args.disable_counterfactual_discrimination_reward,
+    )
+    rew = build_reward_tensor(rows, reward_cfg, success_bonus=args.success_bonus)
+
+    val_obs = val_act = val_rew = None
+    if args.val_traces:
+        val_rows = load_rows(args.val_traces)
+        if args.filter_min_trajectory_score is not None:
+            val_rows = [r for r in val_rows if float(r.get("trajectory_score", 0.0)) >= args.filter_min_trajectory_score]
+        if val_rows:
+            val_obs = torch.tensor([r["obs"] for r in val_rows], dtype=torch.float32)
+            val_act = torch.tensor([r["action"] for r in val_rows], dtype=torch.long)
+            val_rew = build_reward_tensor(val_rows, reward_cfg, success_bonus=args.success_bonus)
 
     act_dim = len(Action)
     if int(act.max().item()) >= act_dim or int(act.min().item()) < 0:

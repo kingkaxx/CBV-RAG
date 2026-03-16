@@ -1,86 +1,82 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter
 from statistics import mean
 from typing import Any, Dict
 
 
-def _safe(v: float) -> float:
-    if v != v:  # NaN
+def _clip01(x: float) -> float:
+    if x != x:
         return 0.0
-    if v == float("inf"):
-        return 1.0
-    if v == float("-inf"):
-        return -1.0
-    return float(max(-1.0, min(1.0, v)))
+    return float(max(0.0, min(1.0, x)))
 
 
-def score_evidence_specificity(
-    original_question: str,
-    question_variants: dict,
-    retrieved_by_query: dict,
-    reranker=None,
-) -> Dict[str, Any]:
-    # lightweight approximation: relevance is taken from rerank/retriever scores already available.
-    chunk_obs: Dict[str, Dict[str, list[float]]] = defaultdict(lambda: {"orig": [], "alt": [], "cf": [], "cluster": []})
+def _safe_str(v: Any) -> str:
+    return str(v or "").strip()
 
-    for qkey, items in (retrieved_by_query or {}).items():
-        qtype = str(qkey)
-        for it in items or []:
-            if not isinstance(it, dict):
-                continue
-            eid = str(it.get("evidence_id", ""))
-            if not eid:
-                continue
-            rel = float(it.get("rerank_score", it.get("retriever_score", 0.0)))
-            if qtype == "original":
-                chunk_obs[eid]["orig"].append(rel)
-            elif "counter" in qtype or "disprove" in qtype or "contrast" in qtype:
-                chunk_obs[eid]["cf"].append(rel)
-                chunk_obs[eid]["alt"].append(rel)
-            else:
-                chunk_obs[eid]["alt"].append(rel)
-            cid = str(it.get("cluster_id", ""))
-            if cid:
-                chunk_obs[eid]["cluster"].append(cid)
+
+def score_evidence_specificity(question: str, evidence_items: list) -> Dict[str, Any]:
+    items = [it for it in (evidence_items or []) if isinstance(it, dict)]
+    if not items:
+        return {
+            "chunk_scores": {},
+            "summary": {
+                "best_specificity_score": 0.0,
+                "mean_specificity": 0.0,
+                "mean_specificity_selected": 0.0,
+                "best_support_strength": 0.0,
+                "mean_genericity": 0.0,
+            },
+        }
+
+    title_keys = [(_safe_str(it.get("title")) or _safe_str(it.get("doc_id")) or "unknown") for it in items]
+    counts = Counter(title_keys)
+    max_repeat = max(1, max(counts.values()))
+    reranks = [float(it.get("rerank_score", 0.0)) for it in items]
+    retrs = [float(it.get("retriever_score", 0.0)) for it in items]
+    rr_min, rr_max = min(reranks), max(reranks)
+    rt_min, rt_max = min(retrs), max(retrs)
+
+    def _norm(v: float, lo: float, hi: float) -> float:
+        if hi <= lo:
+            return 0.5
+        return _clip01((v - lo) / (hi - lo))
 
     chunk_scores: Dict[str, Dict[str, float]] = {}
-    cluster_aggr: Dict[str, Dict[str, list[float]]] = defaultdict(lambda: {"specificity": [], "counterfactual_resistance": [], "support": [], "genericity": []})
+    specificities, genericities, supports = [], [], []
+    selected_specificities = []
 
-    for eid, parts in chunk_obs.items():
-        orig_rel = float(mean(parts["orig"]) if parts["orig"] else 0.0)
-        alt_rel = float(mean(parts["alt"]) if parts["alt"] else 0.0)
-        cf_rel = float(mean(parts["cf"]) if parts["cf"] else alt_rel)
-        specificity = _safe(orig_rel - alt_rel)
-        resistance = _safe(orig_rel - cf_rel)
-        genericity = _safe(alt_rel)
+    for it, tk in zip(items, title_keys):
+        eid = _safe_str(it.get("evidence_id"))
+        if not eid:
+            continue
+        rr = _norm(float(it.get("rerank_score", 0.0)), rr_min, rr_max)
+        rt = _norm(float(it.get("retriever_score", 0.0)), rt_min, rt_max)
+        support = _clip01(0.7 * rr + 0.3 * rt)
+
+        repeat_frac = counts[tk] / max_repeat
+        genericity = _clip01(0.8 * repeat_frac + (0.2 if counts[tk] > 1 else 0.0))
+        novelty = _clip01(1.0 - repeat_frac)
+        specificity = _clip01(support + 0.5 * novelty - 0.6 * genericity)
+
         rec = {
-            "orig_rel": _safe(orig_rel),
-            "alt_rel_mean": _safe(alt_rel),
-            "cf_rel_mean": _safe(cf_rel),
-            "specificity": specificity,
-            "counterfactual_resistance": resistance,
-            "genericity": genericity,
+            "specificity": float(specificity),
+            "genericity": float(genericity),
+            "support_strength": float(support),
+            "novelty": float(novelty),
         }
         chunk_scores[eid] = rec
-        for cid in set(parts["cluster"]):
-            if not cid:
-                continue
-            cluster_aggr[cid]["specificity"].append(specificity)
-            cluster_aggr[cid]["counterfactual_resistance"].append(resistance)
-            cluster_aggr[cid]["support"].append(orig_rel)
-            cluster_aggr[cid]["genericity"].append(genericity)
+        specificities.append(specificity)
+        genericities.append(genericity)
+        supports.append(support)
+        if bool(it.get("is_selected", False)):
+            selected_specificities.append(specificity)
 
-    cluster_scores: Dict[str, Dict[str, float]] = {}
-    for cid, ag in cluster_aggr.items():
-        cluster_scores[cid] = {
-            "specificity": _safe(mean(ag["specificity"]) if ag["specificity"] else 0.0),
-            "counterfactual_resistance": _safe(mean(ag["counterfactual_resistance"]) if ag["counterfactual_resistance"] else 0.0),
-            "support_strength": _safe(mean(ag["support"]) if ag["support"] else 0.0),
-            "genericity": _safe(mean(ag["genericity"]) if ag["genericity"] else 0.0),
-        }
-
-    return {
-        "chunk_scores": chunk_scores,
-        "cluster_scores": cluster_scores,
+    summary = {
+        "best_specificity_score": float(max(specificities) if specificities else 0.0),
+        "mean_specificity": float(mean(specificities) if specificities else 0.0),
+        "mean_specificity_selected": float(mean(selected_specificities) if selected_specificities else 0.0),
+        "best_support_strength": float(max(supports) if supports else 0.0),
+        "mean_genericity": float(mean(genericities) if genericities else 0.0),
     }
+    return {"chunk_scores": chunk_scores, "summary": summary}
