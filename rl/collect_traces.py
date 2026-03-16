@@ -4,7 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from cbvrag.controller_heuristic import HeuristicController
+# from cbvrag.controller_heuristic import HeuristicController
+from cbvrag.controller_trace_mixture import TraceMixtureController
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
 from tools.llm import LLMEngine
@@ -112,7 +113,8 @@ def main() -> int:
             _maybe_clear_temp_index(retriever)
             _maybe_build_temp_index(retriever, ex, qid=qid)
 
-            controller = HeuristicController()
+            # controller = HeuristicController()
+            controller = TraceMixtureController(seed=1000 + i)
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
 
             golds = ex.get("answer") or [""]
