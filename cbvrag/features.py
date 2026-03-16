@@ -16,21 +16,8 @@ def _one_hot_verification(status: str) -> List[float]:
     return [1.0 if status == v else 0.0 for v in vals]
 
 
-def _pool_dicts(state: EpisodeState) -> list[dict]:
-    selected = set(state.selected_evidence_ids)
-    return [
-        {
-            "evidence_id": e.evidence_id,
-            "doc_id": e.doc_id,
-            "chunk_id": e.chunk_id,
-            "title": e.title,
-            "rerank_score": float(e.rerank_score),
-            "retriever_score": float(e.retriever_score),
-            "text": e.short_claim,
-            "is_selected": e.evidence_id in selected,
-        }
-        for e in state.evidence_pool.values()
-    ]
+def _safe_div(a: float, b: float) -> float:
+    return float(a) / max(1.0, float(b))
 
 
 def build_features(state: EpisodeState) -> List[float]:
@@ -104,24 +91,19 @@ def build_features(state: EpisodeState) -> List[float]:
     conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
     score_std_proxy = abs(best - mean_topk)
 
-    num_clusters = float(state.metrics.get("num_clusters", 0.0))
-    largest_cluster_size = float(state.metrics.get("largest_cluster_size", 0.0))
-    largest_cluster_frac = float(state.metrics.get("largest_cluster_frac", 0.0))
-    top_cluster_mean_rerank = float(state.metrics.get("top_cluster_mean_rerank", 0.0))
-    second_cluster_mean_rerank = float(state.metrics.get("second_cluster_mean_rerank", 0.0))
-    cluster_gap = float(state.metrics.get("cluster_gap", 0.0))
-    selected_cluster_count = float(state.metrics.get("selected_cluster_count", 0.0))
-    selected_cluster_diversity = float(state.metrics.get("selected_cluster_diversity", 0.0))
-    selected_same_cluster_frac = float(state.metrics.get("selected_same_cluster_frac", 0.0))
-    evidence_redundancy_proxy = float(state.metrics.get("evidence_redundancy_proxy", 0.0))
-    multi_cluster_support_flag = float(state.metrics.get("multi_cluster_support_flag", 0.0))
-    best_specificity_score = float(state.metrics.get("best_specificity_score", 0.0))
-    mean_specificity_selected = float(state.metrics.get("mean_specificity_selected", 0.0))
-    best_counterfactual_resistance = float(state.metrics.get("best_counterfactual_resistance", 0.0))
-    candidate_count_available = float(state.metrics.get("candidate_count_available", 0.0))
-    candidate_score_gap_top2 = float(state.metrics.get("candidate_score_gap_top2", 0.0))
-    view_disagreement_score = float(state.metrics.get("view_disagreement_score", 0.0))
-    original_specific_cluster_count = float(state.metrics.get("original_specific_cluster_count", 0.0))
+    can_stop_now = 1.0 if (selected_count > 0 and (retrieval_calls >= 2 or state.verification_status == "supported")) else 0.0
+    can_select_now = 1.0 if pool_count > 0 else 0.0
+    can_verify_cheap_now = 1.0 if pool_count > 0 else 0.0
+    can_verify_llm_now = 1.0 if selected_count > 0 else 0.0
+    can_spawn_branch = 1.0 if active_branches < max_branches else 0.0
+    can_prune_branch = 1.0 if active_branches > 1 else 0.0
+    retrieval_budget_left = max(0.0, 1.0 - retrieval_frac)
+    step_budget_left = max(0.0, 1.0 - step_frac)
+
+    clusters = cluster_evidence_items(pool, selected_ids=state.selected_evidence_ids)
+    cluster_stats = summarize_cluster_stats(clusters)
+    specificity = score_evidence_specificity(state.question, pool, selected_ids=state.selected_evidence_ids)
+    specificity_summary = specificity["summary"]
 
     vec = [
         step_frac,
@@ -140,35 +122,6 @@ def build_features(state: EpisodeState) -> List[float]:
         retrieval_budget_left,
     ] + _one_hot_verification(state.verification_status)
 
-    selected_frac_of_pool = selected_count / max(1, pool_count)
-    branch_frac = active_branches / max_branches
-    retrieval_frac = retrieval_calls / max_retrieval
-    step_frac = state.step / max_steps
-
-    unique_titles = set()
-    for eid in state.selected_evidence_ids:
-        ev = state.evidence_pool.get(eid)
-        if ev and getattr(ev, "title", ""):
-            t = (ev.title or "").strip()
-            if t:
-                unique_titles.add(t)
-
-    has_summary = 1.0 if (state.global_summary or "").strip() else 0.0
-    has_final_answer = 1.0 if (state.final_answer or "").strip() else 0.0
-    cheap_verified = 1.0 if verify_calls > 0 else 0.0
-    llm_verified = 1.0 if verify_calls > 1 else 0.0
-    multi_branch = 1.0 if active_branches > 1 else 0.0
-    near_retrieval_exhaustion = 1.0 if retrieval_calls >= max(1, max_retrieval - 1) else 0.0
-    near_step_exhaustion = 1.0 if state.step >= max(1, max_steps - 1) else 0.0
-    context_pressure = selected_count / max_context_chunks
-    selected_nonempty = 1.0 if selected_count > 0 else 0.0
-    retrieval_nonempty = 1.0 if retrieval_calls > 0 else 0.0
-    score_std_proxy = abs(best - mean_topk)
-    conflicting_evidence = 1.0 if (best - second) < 0.05 and pool_count >= 2 else 0.0
-
-    last_action_norm = (last_action / max(1, len(Action) - 1)) if last_action >= 0 else -1.0
-    last_action_onehot = [1.0 if i == last_action else 0.0 for i in range(len(Action))]
-
     vec.extend(
         [
             retrieval_frac,
@@ -183,6 +136,7 @@ def build_features(state: EpisodeState) -> List[float]:
             context_pressure,
             selected_nonempty,
             retrieval_nonempty,
+            pool_nonempty,
             float(len(unique_titles)),
             selected_title_diversity,
             score_std_proxy,
@@ -214,7 +168,27 @@ def build_features(state: EpisodeState) -> List[float]:
         ]
     )
 
-    # Safer action encoding: derive dimensionality from Action enum.
+    vec.extend(
+        [
+            float(cluster_stats["num_clusters"]),
+            float(cluster_stats["largest_cluster_size"]),
+            float(cluster_stats["largest_cluster_frac"]),
+            float(cluster_stats["top_cluster_mean_rerank"]),
+            float(cluster_stats["second_cluster_mean_rerank"]),
+            float(cluster_stats["cluster_gap"]),
+            float(cluster_stats["selected_cluster_count"]),
+            float(cluster_stats["selected_cluster_diversity"]),
+            float(cluster_stats["selected_same_cluster_frac"]),
+            float(cluster_stats["evidence_redundancy_proxy"]),
+            float(cluster_stats["multi_cluster_support_flag"]),
+            float(specificity_summary["best_specificity_score"]),
+            float(specificity_summary["mean_specificity"]),
+            float(specificity_summary["mean_specificity_selected"]),
+            float(specificity_summary["best_support_strength"]),
+            float(specificity_summary["mean_genericity"]),
+        ]
+    )
+
     act_dim = len(Action)
     last_action_norm = (_safe_div(last_action, max(1, act_dim - 1)) if last_action >= 0 else -1.0)
     second_last_action_norm = (_safe_div(second_last_action, max(1, act_dim - 1)) if second_last_action >= 0 else -1.0)
@@ -223,33 +197,8 @@ def build_features(state: EpisodeState) -> List[float]:
     last_action_onehot = [1.0 if i == last_action else 0.0 for i in range(act_dim)]
     second_last_action_onehot = [1.0 if i == second_last_action else 0.0 for i in range(act_dim)]
     vec.extend(last_action_onehot)
+    vec.extend(second_last_action_onehot)
 
-    # Phase-1 appended cluster/specificity feature block.
-    pool_items = _pool_dicts(state)
-    clusters = cluster_evidence_items(pool_items)
-    cstats = summarize_cluster_stats(clusters)
-    sstats = score_evidence_specificity(state.question, pool_items).get("summary", {})
-
-    vec.extend(
-        [
-            float(cstats.get("num_clusters", 0)),
-            float(cstats.get("largest_cluster_size", 0)),
-            float(cstats.get("largest_cluster_frac", 0.0)),
-            float(cstats.get("top_cluster_mean_rerank", 0.0)),
-            float(cstats.get("second_cluster_mean_rerank", 0.0)),
-            float(cstats.get("cluster_gap", 0.0)),
-            float(cstats.get("selected_cluster_count", 0)),
-            float(cstats.get("selected_cluster_diversity", 0.0)),
-            float(cstats.get("selected_same_cluster_frac", 0.0)),
-            float(cstats.get("evidence_redundancy_proxy", 0.0)),
-            float(cstats.get("multi_cluster_support_flag", 0.0)),
-            float(sstats.get("best_specificity_score", 0.0)),
-            float(sstats.get("mean_specificity", 0.0)),
-            float(sstats.get("mean_specificity_selected", 0.0)),
-            float(sstats.get("best_support_strength", 0.0)),
-            float(sstats.get("mean_genericity", 0.0)),
-        ]
-    )
     return [float(v) for v in vec]
 
 
