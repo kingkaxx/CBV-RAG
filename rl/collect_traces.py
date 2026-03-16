@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from cbvrag.controller_heuristic import HeuristicController
+from cbvrag.controller_trace_mixture import TraceMixtureController
 from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
 from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.runner import run_episode
@@ -109,7 +109,8 @@ def main() -> int:
             _maybe_clear_temp_index(retriever)
             _maybe_build_temp_index(retriever, ex, qid=qid)
 
-            controller = HeuristicController()
+          
+            controller = TraceMixtureController(seed=1000 + i)
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
 
             golds = ex.get("answer") or [""]
