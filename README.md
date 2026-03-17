@@ -1,130 +1,146 @@
-# CBV-RAG / CF-RAG
+# CBV-RAG: Cost-Aware Budget-Verified Retrieval-Augmented Generation
 
-This repository contains a **CF-RAG** implementation (counterfactual retrieval-augmented generation) and a newer **CBV-RAG scaffold** for budget-aware, branch-based retrieval + verification with an RL-friendly control loop.
-
-> Current status:
-> - CF-RAG pipeline is runnable and integrated with dataset loaders/evaluation scripts.
-> - CBV-RAG modules are implemented as a modular scaffold (tools, env, heuristic controller, RL scripts) and are intended for iterative experimentation.
-
----
-
-## 1) What is in this repository
-
-### CF-RAG (existing pipeline)
-- Counterfactual query generation.
-- Synergetic retrieval over original + counterfactual queries.
-- Evidence clustering/sampling and explanatory answer generation.
-- Interactive CLI (`main.py`) and dataset evaluation scripts.
-
-Key files:
-- `cfrag_pipeline.py`
-- `retriever.py`
-- `main.py`
-- `run_evaluation.py`
-
-### CBV-RAG (new scaffold)
-- Token/cost instrumentation (`metrics/`).
-- Modular tools (`tools/`) for LLM generation, retrieval, reranking, and context selection.
-- Branch/state/action runtime (`cbvrag/`) with Gym-like environment and heuristic controller.
-- RL data collection + policy training/evaluation scripts (`rl/`).
-- Baseline and frontier scripts (`scripts/`).
-
-Key files:
-- `metrics/usage.py`, `metrics/cost.py`
-- `tools/llm.py`, `tools/retrieve.py`, `tools/rerank.py`, `tools/select.py`
-- `cbvrag/runner.py`, `cbvrag/env.py`, `cbvrag/controller_heuristic.py`
-- `rl/collect_traces.py`, `rl/train_il.py`, `rl/train_offline.py`, `rl/eval_policy.py`
-- `scripts/run_cfrag_baseline.py`, `scripts/run_cbvrag_eval.py`, `scripts/plot_frontier.py`
+CBV-RAG is a training-free, budget-aware RAG framework that combines
+**attribution scoring**, **null-branch parametric detection**, and a
+**two-tier NLI verifier** with an RL-trained controller to achieve high
+answer quality at reduced token cost.
 
 ---
 
-## 2) Requirements
+## System Overview
 
-- Python 3.9+ recommended
-- CUDA GPU recommended for model inference
-- Local Hugging Face-compatible model directories (or hub-accessible IDs)
+CBV-RAG extends retrieval-augmented generation with three principled components:
 
-Install dependencies:
+### Attribution Score (Attr)
+
+$$
+\text{Attr}(q, D) = \alpha \cdot \text{GD}(q, D) + (1-\alpha) \cdot \text{PS}(q, D, \tilde{Q})
+$$
+
+| Term | Description |
+|------|-------------|
+| $\text{GD}(q, D)$ | **Grounded Directness** — max NLI entailment probability over retrieved docs $D$ with query $q$ as hypothesis. Measures how strongly the evidence directly supports the question. |
+| $\text{PS}(q, D, \tilde{Q})$ | **Parametric Stability** — $1 - \max_{\tilde{q} \in \tilde{Q}} \text{ent}(D, \tilde{q}) \;/\; (\text{ent}(D, q) + \varepsilon)$. Measures counterfactual resistance: how exclusively the docs support the *original* query vs adversarial alternatives. |
+| $\alpha$ | Mixing coefficient (default 0.5). |
+
+Both components are **training-free** and **model-agnostic** — no LLM log-probabilities are required.  They rely solely on a DeBERTa-large-MNLI classification head.
+
+---
+
+## Architecture
+
+```
+Query q
+  │
+  ▼
+┌─────────────────────────────────────────────────────┐
+│                  CBV-RAG Episode Loop                │
+│                                                      │
+│  ┌────────────┐   ┌──────────┐   ┌───────────────┐  │
+│  │  Retrieve  │──▶│  Select  │──▶│  Two-Tier NLI │  │
+│  │  (FAISS /  │   │ Context  │   │   Verifier    │  │
+│  │   BM25)    │   │ (cluster)│   │ Tier1: DeBERTa│  │
+│  └────────────┘   └──────────┘   │ Tier2: LLM    │  │
+│        │                         └───────┬───────┘  │
+│        ▼                                 │           │
+│  ┌─────────────────┐             ┌───────▼───────┐   │
+│  │  Branch Manager │             │  Attr Score   │   │
+│  │ (counterfactual │             │  GD + PS      │   │
+│  │  hypotheses)    │             └───────┬───────┘   │
+│  └─────────────────┘                     │           │
+│                                          ▼           │
+│                              ┌───────────────────┐   │
+│                              │  Null Branch      │   │
+│                              │  M(q, ∅) vs M(q,D)│   │
+│                              │  Attr arbitration  │   │
+│                              └────────┬──────────┘   │
+└───────────────────────────────────────┼──────────────┘
+                                        ▼
+                              Final Answer + Episode Record
+                              (parametric_hallucination_risk flag)
+```
+
+### Null Branch
+
+The **null branch** calls the LLM with *no context* — $M(q, \emptyset)$ — to
+capture the model's purely parametric answer.  After the main episode, the Attr
+score of the evidence-grounded answer is compared against a threshold.  If
+$\text{Attr}(q, D) < \theta$, the system flags
+`parametric_hallucination_risk = True`, indicating the evidence-grounded answer
+is weakly attributed and the model may be relying on unverified parametric memory.
+
+### Two-Tier NLI Verifier
+
+| Tier | Trigger | Model |
+|------|---------|-------|
+| Tier 1 (cheap) | Always | DeBERTa-large-MNLI entailment per claim |
+| Tier 2 (full) | Score ∈ [0.4, 0.7] uncertain zone | LLM structured verification prompt |
+
+Tier 2 is only triggered when Tier 1 cannot confidently classify a claim,
+minimising expensive LLM calls.
+
+### RL Controller
+
+An MLP/GRU policy is trained in two stages:
+
+1. **Imitation Learning (IL)** — from heuristic controller traces.
+2. **Offline RL (AWR)** — using the Attr-shaped reward:
+
+$$
+R = \text{EM} - \lambda_\text{token} \cdot \frac{T}{T_{\max}} - \lambda_\text{step} \cdot S + \lambda_\text{attr} \cdot \text{Attr}(q, D)
+$$
+
+This learns a **budget-conditioned decision boundary** — when to stop
+retrieving given the current attribution quality and remaining budget.
+
+---
+
+## Results
+
+### Main Comparison (placeholder — fill after experiments)
+
+| System | HotpotQA EM | HotpotQA F1 | Tokens | Ret. Calls |
+|--------|-------------|-------------|--------|------------|
+| Vanilla RAG | — | — | — | — |
+| CF-RAG | — | — | — | — |
+| VeriCite (NLI only) | — | — | — | — |
+| CBV-RAG (heuristic) | — | — | — | — |
+| CBV-RAG (IL) | — | — | — | — |
+| CBV-RAG (offline RL) | — | — | — | — |
+
+| System | TriviaQA EM | PopQA EM | MuSiQue EM | PubHealth EM |
+|--------|-------------|----------|------------|--------------|
+| Vanilla RAG | — | — | — | — |
+| CF-RAG | — | — | — | — |
+| CBV-RAG (offline RL) | — | — | — | — |
+
+### Ablation Study (placeholder)
+
+| Config | EM | F1 | Tokens | PHR Rate |
+|--------|----|----|--------|----------|
+| Full CBV-RAG | — | — | — | — |
+| No null branch | — | — | — | — |
+| GD only (α=1) | — | — | — | — |
+| No NLI verifier | — | — | — | — |
+
+*PHR = Parametric Hallucination Risk rate.*
+
+---
+
+## Reproducing Paper Results
+
+### Step 0: Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
+### Step 1: Configure model paths
 
-## 3) Configuration
+Edit `config.py` to set `LLM_MODEL_ID`, `RERANKER_MODEL_ID`, and
+`EMBEDDING_MODEL_ID` to your local model directories or Hugging Face IDs.
 
-Configuration is centralized in `config.py`.
-
-Important groups:
-
-1. **Model paths/devices**
-   - `LLM_MODEL_ID`, `RERANKER_MODEL_ID`, `EMBEDDING_MODEL_ID`
-   - `LLM_DEVICE`, `RERANKER_DEVICE`, `EMBEDDING_DEVICE`
-
-2. **CF-RAG generation/retrieval settings**
-   - `MAX_NEW_TOKENS`, `EXPLANATORY_TEMPERATURE`, `COUNTERFACTUAL_TEMPERATURE`
-   - `RETRIEVAL_TOP_K`, `RERANKER_TOP_K`
-
-3. **CBV-RAG defaults**
-   - `MAX_CONTEXT_CHUNKS`, `MAX_CONTEXT_TOKENS`
-   - `RETRIEVAL_POOL_K0`, `RERANK_BATCH_SIZE`
-   - `CBVRAG_MAX_STEPS`, `CBVRAG_MAX_BRANCHES`, `CBVRAG_MAX_RETRIEVAL_CALLS`
-
----
-
-## 4) Running CF-RAG
-
-### Interactive mode
-
-```bash
-python main.py
-```
-
-### Batch evaluation
-
-```bash
-python run_evaluation.py --dataset hotpotqa --num_samples 50
-python run_evaluation.py --dataset triviaqa --num_samples 50
-python run_evaluation.py --dataset popqa --num_samples 50
-python run_evaluation.py --dataset musique --num_samples 50
-python run_evaluation.py --dataset pubhealth --num_samples 50
-```
-
-Outputs are written as JSONL into `eval_results/` by default.
-
----
-
-## 5) Running baseline + CBV-RAG experiments
-
-### 5.1 CF-RAG baseline with cost logging
-
-```bash
-python scripts/run_cfrag_baseline.py --dataset hotpotqa --num_samples 100
-```
-
-This writes per-example logs to:
-- `logs/baseline/<dataset>.jsonl`
-
-### 5.2 CBV-RAG heuristic evaluation
-
-```bash
-python scripts/run_cbvrag_eval.py \
-  --dataset hotpotqa \
-  --baseline_jsonl logs/baseline/hotpotqa.jsonl \
-  --output logs/cbvrag_eval_hotpotqa.json
-```
-
-### 5.3 Frontier plotting
-
-```bash
-python scripts/plot_frontier.py --input logs/cbvrag_eval_hotpotqa.json --out logs/frontier_hotpotqa.png
-```
-
----
-
-
-### Multi-dataset KB + global index
+### Step 2: Build multi-dataset knowledge base
 
 ```bash
 python data/build_multidataset_kb.py \
@@ -133,137 +149,188 @@ python data/build_multidataset_kb.py \
   --qa_out data/multidataset_qa.jsonl \
   --kb_out data/global_kb_chunks.jsonl
 
-python retrieval/global_index.py --mode build --kb_jsonl data/global_kb_chunks.jsonl --index_dir data/global_index
-python retrieval/global_index.py --mode diagnose --qa_jsonl data/multidataset_qa.jsonl --index_dir data/global_index --top_k 20
+python retrieval/global_index.py \
+  --mode build \
+  --kb_jsonl data/global_kb_chunks.jsonl \
+  --index_dir data/global_index
 ```
 
-## 6) RL workflow
-
-### Step 1: Collect heuristic traces (GPU or CPU)
+### Step 3: Run baselines
 
 ```bash
-python rl/collect_traces.py   --dataset hotpotqa   --num_samples 500   --llm_device cuda:0   --output data/traces/hotpotqa_raw.jsonl
+python scripts/run_baselines.py --dataset hotpotqa --num_samples 500 \
+    --output logs/baselines_hotpotqa.json
 ```
 
-Useful filtering controls are available directly in collection (`--keep_only_successful`, `--min_episode_reward`, `--max_episode_tokens`, `--max_episode_steps`).
-
-### Step 2: Prepare train/val traces without qid leakage
+### Step 4: Run CBV-RAG evaluation (heuristic controller)
 
 ```bash
-python rl/prepare_traces.py   --input data/traces/hotpotqa_raw.jsonl   --output_dir data/traces/hotpotqa_prepared   --val_ratio 0.2   --seed 42   --only_successful
+python scripts/run_cbvrag_eval.py \
+  --dataset hotpotqa \
+  --controller_type heuristic \
+  --output logs/eval_heuristic_hotpotqa.json
 ```
 
-Outputs:
-- `train.jsonl`
-- `val.jsonl`
-- `summary.json`
-
-### Step 3: Train IL policy (architecture configurable)
+### Step 5: Collect traces for RL
 
 ```bash
-python rl/train_il.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --out checkpoints/policy_il.pt   --policy_type mlp   --hidden_dim 128   --num_layers 2   --dropout 0.0   --history_len 1   --use_action_weights   --seed 42
+# Collect raw traces with Attr reward labelling
+python rl/collect_traces.py \
+  --dataset hotpotqa \
+  --num_samples 2000 \
+  --use_attr_reward \
+  --output data/traces/hotpotqa_attr.jsonl
+
+# Prepare train/val split
+python rl/prepare_traces.py \
+  --input data/traces/hotpotqa_attr.jsonl \
+  --output_dir data/traces/hotpotqa_prepared \
+  --val_ratio 0.15 \
+  --seed 42
 ```
 
-
-IL checkpoints now store runtime-safety metadata used by the learned controller loader:
-- `state_dict`, `obs_dim`, `act_dim`, `arch`
-- `feature_schema_version`, `action_enum_version`, `action_names`
-
-Loading fails fast if feature/action metadata is incompatible with the current runtime.
-
-### Step 4: Train offline RL policy (modular objectives)
+### Step 6: Train IL → AWR policy
 
 ```bash
-python rl/train_offline.py   --traces data/traces/hotpotqa_prepared/train.jsonl   --val_traces data/traces/hotpotqa_prepared/val.jsonl   --init_policy checkpoints/policy_il.pt   --out checkpoints/policy_offline.pt   --objective awr   --bc_coef 0.1   --adv_temperature 1.0   --entropy_coef 0.0   --success_bonus 0.0   --seed 42
+# Stage 1: Imitation learning
+python rl/train_il.py \
+  --traces data/traces/hotpotqa_prepared/train.jsonl \
+  --val_traces data/traces/hotpotqa_prepared/val.jsonl \
+  --out checkpoints/policy_il.pt \
+  --policy_type mlp_residual
+
+# Stage 2: Offline RL with Attr reward shaping
+python rl/train_offline.py \
+  --traces data/traces/hotpotqa_prepared/train.jsonl \
+  --val_traces data/traces/hotpotqa_prepared/val.jsonl \
+  --init_policy checkpoints/policy_il.pt \
+  --out checkpoints/policy_offline.pt \
+  --objective awr \
+  --use_attr_shaping \
+  --lambda_token 0.1 \
+  --lambda_step 0.05 \
+  --attr_bonus 0.2 \
+  --token_budget 4096
 ```
 
-### Step 5: Evaluate heuristic vs learned controllers end-to-end
+### Step 7: Evaluate learned controller
 
 ```bash
-python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type heuristic --llm_device cuda:0 --output logs/eval_heuristic.json
-python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type il --policy_ckpt checkpoints/policy_il.pt --policy_mode greedy --llm_device cuda:0 --output logs/eval_il.json
-python scripts/run_cbvrag_eval.py --dataset hotpotqa --controller_type offline --policy_ckpt checkpoints/policy_offline.pt --policy_mode greedy --llm_device cuda:0 --output logs/eval_offline.json
+python scripts/run_cbvrag_eval.py \
+  --dataset hotpotqa \
+  --controller_type offline \
+  --policy_ckpt checkpoints/policy_offline.pt \
+  --policy_mode greedy \
+  --output logs/eval_offline_hotpotqa.json
 ```
 
-Each eval run also writes per-example records (JSONL) with EM/F1, token use, retrieval calls, steps, branches, and success/early-stop indicators.
-
-### Step 6: Side-by-side controller comparison
+### Step 8: Run ablation study
 
 ```bash
-python scripts/compare_controllers.py   --inputs heuristic=logs/eval_heuristic.records.jsonl il=logs/eval_il.records.jsonl offline=logs/eval_offline.records.jsonl   --output logs/controller_comparison.json
+python scripts/run_ablation.py \
+  --dataset hotpotqa \
+  --num_samples 200 \
+  --output logs/ablation_hotpotqa.json
 ```
 
-### Step 7: Helper experiment scripts
+### Step 9: Plot Pareto frontier
 
 ```bash
-scripts/run_trace_scale_ablation.sh hotpotqa
-scripts/run_reward_ablation.sh data/traces/hotpotqa_prepared/train.jsonl data/traces/hotpotqa_prepared/val.jsonl
-scripts/run_controller_compare.sh hotpotqa checkpoints/policy_il.pt checkpoints/policy_offline.pt
+python scripts/plot_frontier.py \
+  --inputs \
+    logs/baselines_hotpotqa.json \
+    logs/eval_heuristic_hotpotqa.json \
+    logs/eval_offline_hotpotqa.json \
+    logs/ablation_hotpotqa.json \
+  --out logs/frontier_hotpotqa.png \
+  --title HotpotQA
+```
+
+### Multi-dataset rollout
+
+```bash
+for ds in hotpotqa triviaqa popqa musique pubhealth; do
+  python scripts/run_cbvrag_eval.py \
+    --dataset $ds \
+    --controller_type offline \
+    --policy_ckpt checkpoints/policy_offline.pt \
+    --output logs/eval_offline_${ds}.json
+done
 ```
 
 ---
 
-## 7) Token-efficiency design notes (CBV-RAG)
+## Requirements
 
-The CBV scaffold enforces/encourages:
+- Python 3.9+
+- CUDA GPU recommended for model inference
+- PyTorch ≥ 2.0
+- `transformers` ≥ 4.38 (for DeBERTa-large-MNLI)
+- `faiss-cpu` or `faiss-gpu`
+- `matplotlib` ≥ 3.7 (for PDF frontier plots)
 
-- Retrieval pool can be large, but prompt context is selected with caps.
-- Context selection bounded by:
-  - `max_chunks` (default 8)
-  - `max_tokens` (default 1500)
-- Verification is split into:
-  - cheap heuristic verification first
-  - LLM verification only when needed
-- Branching budget to avoid uncontrolled token growth.
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
-## 8) Directory overview
+## Repository Layout
 
-```text
-.
-├── cfrag_pipeline.py
-├── retriever.py
-├── main.py
-├── run_evaluation.py
-├── config.py
-├── model_loader.py
-├── data_loader.py
-├── evaluation.py
-├── metrics/
-├── tools/
+```
+CBV-RAG/
 ├── cbvrag/
+│   ├── attribution.py          # Attr score: GD + PS components
+│   ├── runner.py               # Episode loop + null branch arbitration
+│   ├── env.py                  # Gym-like RL environment
+│   ├── actions.py              # 11-action discrete space
+│   ├── state.py                # EpisodeState, Branch, EvidenceItem
+│   ├── features.py             # Observation feature extraction (v5)
+│   ├── reward.py               # Step-level reward computation
+│   ├── prompts.py              # LLM prompt templates
+│   ├── controller_heuristic.py # Rule-based policy
+│   └── controller_learned.py   # Learned policy loader
+├── tools/
+│   ├── llm.py                  # LLMEngine wrapper
+│   ├── retrieve.py             # RetrieverTool (cached)
+│   ├── rerank.py               # CrossEncoderReranker
+│   ├── select.py               # Cluster-aware context selection
+│   └── verify.py               # Two-tier NLI verifier
 ├── rl/
+│   ├── collect_traces.py       # Trace collection (+ --use_attr_reward)
+│   ├── train_il.py             # Imitation learning
+│   ├── train_offline.py        # Offline RL (AWR) + Attr reward shaping
+│   ├── prepare_traces.py       # Train/val split without qid leakage
+│   ├── eval_policy.py          # Policy evaluation
+│   └── policy.py               # MLP / GRU policy architectures
 ├── scripts/
-├── logs/
-├── eval_results/
-└── requirements.txt
+│   ├── run_cbvrag_eval.py      # CBV-RAG end-to-end evaluation
+│   ├── run_baselines.py        # Vanilla RAG / CF-RAG / VeriCite baselines
+│   ├── run_ablation.py         # 4-config ablation study
+│   ├── plot_frontier.py        # Pareto frontier (PNG + PDF)
+│   └── compare_controllers.py  # Side-by-side controller comparison
+├── metrics/
+│   ├── usage.py                # Token usage tracker
+│   └── cost.py                 # Cost estimation
+├── cfrag_pipeline.py           # CF-RAG legacy pipeline
+├── retriever.py                # Knowledge base retriever
+├── config.py                   # Centralised configuration
+├── evaluation.py               # EM / F1 metrics
+├── data_loader.py              # Dataset loading utilities
+└── tests/
+    ├── test_attribution.py     # Unit tests for attribution module
+    └── test_runner_stop_semantics.py
 ```
 
 ---
 
-## 9) Practical notes / caveats
+## Citation
 
-- Some scripts load large local models and may require substantial VRAM.
-- Ensure model IDs/paths in `config.py` match your local environment.
-- The CBV-RAG stack is structured for experimentation and iteration; you should expect to tune prompts, budgets, and rewards for your dataset/hardware constraints.
-
----
-
-## 10) Quick sanity checklist
-
-1. Verify model paths in `config.py`.
-2. Confirm CUDA devices referenced in config are valid.
-3. Run a small CF-RAG eval (`--num_samples 5`).
-4. Run baseline logging script on same subset.
-5. Run CBV heuristic eval and compare token/accuracy metrics.
-
-
-
-### Multi-dataset rollout benchmark runner
-
-```bash
-python scripts/run_multidataset_benchmark.py --controller_type heuristic
-python scripts/run_multidataset_benchmark.py --controller_type il --policy_ckpt checkpoints/policy_il.pt
-python scripts/run_multidataset_benchmark.py --controller_type offline --policy_ckpt checkpoints/policy_offline.pt
+```bibtex
+@inproceedings{cbvrag2025,
+  title     = {CBV-RAG: Cost-Aware Budget-Verified Retrieval-Augmented Generation},
+  author    = {[Authors]},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2025},
+}
 ```
