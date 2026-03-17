@@ -9,6 +9,7 @@ from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_s
 from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
+from rl.train_offline import shape_reward_with_attr
 from tools.llm import LLMEngine
 from tools.rerank import CrossEncoderReranker
 from tools.retrieve import RetrieverTool
@@ -67,11 +68,43 @@ def _maybe_clear_temp_index(retriever: KnowledgeBaseRetriever) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Collect heuristic controller traces for IL/offline-RL training."
+    )
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--cache_dir", default="./huggingface_cache")
     ap.add_argument("--output", default=None)
     ap.add_argument("--num_samples", type=int, default=None)
+    # ---- Attr reward re-scoring ----
+    ap.add_argument(
+        "--use_attr_reward",
+        action="store_true",
+        help=(
+            "Re-score each episode's reward using the Attr-based reward shaping "
+            "from rl/train_offline.py instead of the raw trajectory_score. "
+            "This ensures the IL traces used for behavioural cloning are labelled "
+            "with the same reward the offline RL policy will optimise, making the "
+            "two-stage IL→AWR pipeline self-consistent. "
+            "The 'attr_score' field (from the null-branch arbitration record) is "
+            "read from the episode log; episodes without this field receive 0.0."
+        ),
+    )
+    ap.add_argument(
+        "--attr_lambda_token", type=float, default=0.1,
+        help="Token penalty weight for Attr-shaped reward (default 0.1).",
+    )
+    ap.add_argument(
+        "--attr_lambda_step", type=float, default=0.05,
+        help="Step penalty weight for Attr-shaped reward (default 0.05).",
+    )
+    ap.add_argument(
+        "--attr_bonus", type=float, default=0.2,
+        help="Attribution bonus weight for Attr-shaped reward (default 0.2).",
+    )
+    ap.add_argument(
+        "--token_budget", type=int, default=4096,
+        help="Token budget denominator for normalisation (default 4096).",
+    )
     args = ap.parse_args()
 
     output = Path(args.output or f"data/traces/{args.dataset}.jsonl")
@@ -102,6 +135,11 @@ def main() -> int:
 
     data = load_and_process_data(args.dataset, args.cache_dir, args.num_samples)
 
+    # Accumulators for summary statistics.
+    summary_em: list = []
+    summary_tokens: list = []
+    summary_attr: list = []
+
     with output.open("w", encoding="utf-8") as f:
         for i, ex in enumerate(data):
             qid = str(i)
@@ -109,7 +147,6 @@ def main() -> int:
             _maybe_clear_temp_index(retriever)
             _maybe_build_temp_index(retriever, ex, qid=qid)
 
-          
             controller = TraceMixtureController(seed=1000 + i)
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
 
@@ -118,9 +155,20 @@ def main() -> int:
             correct = any(str(g).strip().lower() in pred_norm for g in golds if str(g).strip())
             traj_score = _trajectory_score(log, correct)
 
+            # Extract episode-level Attr score from null-branch arbitration record.
+            null_branch_record = log.get("null_branch") or {}
+            attr_result = null_branch_record.get("attr_score") or {}
+            episode_attr_score = float(attr_result.get("attr", 0.0))
+
+            # Token usage for this episode (sum over all steps).
             state_dict = (log.get("state") or {})
             evidence_pool_dict = state_dict.get("evidence_pool") or {}
             selected_ids = state_dict.get("selected_evidence_ids") or []
+            step_logs = log.get("steps", [])
+            episode_tokens = sum(
+                int((s.get("costs") or {}).get("tokens_used_this_step", 0))
+                for s in step_logs
+            )
 
             class SimpleEvidence:
                 def __init__(self, evidence_id: str, payload: dict):
@@ -134,18 +182,38 @@ def main() -> int:
             cluster_stats = summarize_cluster_stats(cluster_evidence_items(evs, selected_ids=selected_ids))
             specificity_summary = score_evidence_specificity(ex["question"], evs, selected_ids=selected_ids)["summary"]
 
-            step_logs = log.get("steps", [])
             for t, tr in enumerate(controller.trace):
                 step_info = step_logs[t] if t < len(step_logs) else {}
+
+                if args.use_attr_reward:
+                    # Build a synthetic row that shape_reward_with_attr can consume.
+                    synthetic_row = {
+                        "terminal_correct": bool(correct),
+                        "step_info": step_info,
+                        "attr_score": episode_attr_score,
+                        "t": t,
+                    }
+                    row_reward = shape_reward_with_attr(
+                        synthetic_row,
+                        lambda_token=args.attr_lambda_token,
+                        lambda_step=args.attr_lambda_step,
+                        attr_bonus=args.attr_bonus,
+                        token_budget=args.token_budget,
+                    )
+                else:
+                    row_reward = float(step_info.get("costs", {}).get("new_branch_created", 0) * 0.01)
+
                 row = {
                     "qid": qid,
                     "t": t,
                     "obs": tr["obs"],
                     "action": tr["action"],
-                    "reward": float(step_info.get("costs", {}).get("new_branch_created", 0) * 0.01),
+                    "reward": row_reward,
                     "done": t == len(controller.trace) - 1,
                     "terminal_correct": bool(correct),
                     "trajectory_score": traj_score,
+                    # Store Attr score so downstream offline-RL can re-use it.
+                    "attr_score": episode_attr_score,
                     "question": ex["question"],
                     "pred": pred,
                     "gold_answers": golds,
@@ -156,7 +224,24 @@ def main() -> int:
                 }
                 f.write(json.dumps(row) + "\n")
 
+            # Accumulate summary stats once per episode (at episode boundary).
+            summary_em.append(1.0 if correct else 0.0)
+            summary_tokens.append(episode_tokens)
+            summary_attr.append(episode_attr_score)
+
     _maybe_clear_temp_index(retriever)
+
+    # Print summary statistics so operators can verify trace quality.
+    n = max(1, len(summary_em))
+    summary = {
+        "dataset": args.dataset,
+        "num_episodes": n,
+        "use_attr_reward": args.use_attr_reward,
+        "mean_em": float(sum(summary_em) / n),
+        "mean_token_use": float(sum(summary_tokens) / n),
+        "mean_attr_score": float(sum(summary_attr) / n),
+    }
+    print(json.dumps(summary, indent=2))
     return 0
 
 
