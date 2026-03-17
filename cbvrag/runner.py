@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cbvrag.actions import Action
+from cbvrag.attribution import compute_attr
 from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
 from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.features import build_features
 from cbvrag.prompts import answer_prompt, counterfactual_prompt, verify_prompt
 from cbvrag.state import Branch, EpisodeState, EvidenceItem
 from tools.select import select_context
+
+logger = logging.getLogger(__name__)
 
 
 def default_budgets() -> Dict[str, int]:
@@ -298,6 +302,141 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
     return step_costs
 
 
+def generate_null_branch(
+    question: str,
+    llm: Any,
+    null_branch_threshold: float = 0.3,
+    attr_device: str = "cpu",
+) -> Dict[str, Any]:
+    """Generate a *null branch* answer by calling the LLM with **empty context**.
+
+    The null branch implements M(q, ∅) — the model's purely parametric answer
+    when no retrieved evidence is provided.  This captures what the LLM "already
+    knows" from its pre-training weights, without any grounding.
+
+    The null branch is used in arbitration: if the null branch wins (i.e. the
+    Attr score of the evidence-grounded branches is below *null_branch_threshold*),
+    the result is flagged as ``parametric_hallucination_risk=True`` because the
+    model is relying on unverified parametric memory rather than retrieved facts.
+
+    Parameters
+    ----------
+    question:
+        The user query.
+    llm:
+        An ``LLMEngine`` instance (or any object with a ``.generate()`` method
+        compatible with the LLMEngine interface).
+    null_branch_threshold:
+        Attr score threshold below which the null branch is considered to "win".
+        Default is 0.3.
+    attr_device:
+        Torch device string used when computing the Attr score for comparison.
+        Default is ``"cpu"``.
+
+    Returns
+    -------
+    dict with keys:
+        * ``"branch_type"`` (str): always ``"null"``.
+        * ``"answer"`` (str): the model's raw parametric answer.
+        * ``"usage"`` (dict): token usage record from the LLM call.
+        * ``"null_branch_threshold"`` (float): threshold used for arbitration.
+        * ``"parametric_hallucination_risk"`` (bool): set during arbitration
+          (initially ``False``; updated by :func:`arbitrate_null_branch`).
+    """
+    # Call the LLM with an empty context — no snippets, no summaries.
+    prompt = (
+        "Answer the following question based solely on your own knowledge. "
+        "Be concise.\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+    answer, usage = llm.generate(prompt, max_new_tokens=96, temperature=0.0, name="null_branch")
+    logger.debug("generate_null_branch: question=%r  answer=%r", question[:80], answer[:80])
+
+    return {
+        "branch_type": "null",
+        "answer": answer.strip(),
+        "usage": usage,
+        "null_branch_threshold": null_branch_threshold,
+        "parametric_hallucination_risk": False,
+    }
+
+
+def arbitrate_null_branch(
+    null_branch: Dict[str, Any],
+    grounded_answer: str,
+    docs: List[str],
+    query: str,
+    counterfactual_queries: Optional[List[str]] = None,
+    alpha: float = 0.5,
+    attr_device: str = "cpu",
+) -> Dict[str, Any]:
+    """Compare the null branch against evidence-grounded branches using Attr score.
+
+    Arbitration logic
+    -----------------
+    1. Compute Attr(q, D) for the retrieved document set.
+    2. If Attr < ``null_branch["null_branch_threshold"]``, the evidence-grounded
+       branches are considered too weakly attributed — the null branch "wins" and
+       ``parametric_hallucination_risk`` is set to ``True``.
+    3. The winning answer and arbitration metadata are returned for inclusion in
+       the episode record.
+
+    Parameters
+    ----------
+    null_branch:
+        The record returned by :func:`generate_null_branch`.
+    grounded_answer:
+        The answer produced by the evidence-grounded branch.
+    docs:
+        Retrieved document passages (plain text) used for Attr computation.
+    query:
+        The original user question.
+    counterfactual_queries:
+        Optional list of counterfactual query strings for the PS component.
+    alpha:
+        Mixing coefficient for :func:`~cbvrag.attribution.compute_attr`.
+    attr_device:
+        Torch device string passed to the NLI model.
+
+    Returns
+    -------
+    dict — the updated *null_branch* record with additional keys:
+        * ``"attr_score"`` (dict): full output of ``compute_attr``.
+        * ``"grounded_answer"`` (str): the evidence-grounded answer.
+        * ``"winning_branch"`` (str): ``"null"`` or ``"grounded"``.
+        * ``"parametric_hallucination_risk"`` (bool): ``True`` if null wins.
+    """
+    counterfactual_queries = counterfactual_queries or []
+    attr_result = compute_attr(
+        query=query,
+        docs=docs,
+        counterfactual_queries=counterfactual_queries,
+        alpha=alpha,
+        device=attr_device,
+    )
+
+    threshold = float(null_branch.get("null_branch_threshold", 0.3))
+    attr_score = attr_result["attr"]
+    null_wins = attr_score < threshold
+
+    null_branch = dict(null_branch)  # shallow copy — do not mutate the original
+    null_branch["attr_score"] = attr_result
+    null_branch["grounded_answer"] = grounded_answer
+    null_branch["winning_branch"] = "null" if null_wins else "grounded"
+    null_branch["parametric_hallucination_risk"] = null_wins
+
+    logger.info(
+        "arbitrate_null_branch: attr=%.4f  threshold=%.2f  winner=%s  "
+        "parametric_hallucination_risk=%s",
+        attr_score,
+        threshold,
+        null_branch["winning_branch"],
+        null_wins,
+    )
+    return null_branch
+
+
 def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: Dict | None = None, qid: str = "") -> Tuple[str, Dict]:
     budgets = {**default_budgets(), **(budgets or {})}
     state = _make_state(question, qid=qid or "unknown", budgets=budgets)
@@ -509,6 +648,38 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     if not state.final_answer:
         _force_terminal_stop()
 
+    # ---------- Null-branch arbitration ----------------------------------------
+    # Generate a purely parametric answer (no context) and compare it against
+    # the evidence-grounded answer using the Attr score.  The result is stored
+    # in the episode record as an inspectable field so that downstream consumers
+    # can decide how to handle parametric-hallucination-risk cases.
+    null_branch_record: Dict[str, Any] = {}
+    try:
+        llm = tools["llm"]
+        grounded_docs = [
+            state.evidence_pool[eid].short_claim
+            for eid in state.selected_evidence_ids
+            if eid in state.evidence_pool
+        ]
+        # Derive counterfactual queries from spawned branches (if any).
+        counterfactual_queries = [
+            b.hypothesis
+            for bid, b in state.branches.items()
+            if bid != "b0" and b.hypothesis and getattr(b, "status", "active") != "pruned"
+        ]
+        null_branch_raw = generate_null_branch(question, llm)
+        null_branch_record = arbitrate_null_branch(
+            null_branch=null_branch_raw,
+            grounded_answer=state.final_answer,
+            docs=grounded_docs,
+            query=question,
+            counterfactual_queries=counterfactual_queries,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Null-branch arbitration failed (non-fatal): %s", exc)
+        null_branch_record = {"branch_type": "null", "error": str(exc), "parametric_hallucination_risk": False}
+    # --------------------------------------------------------------------------
+
     out = {
         "state": asdict(state),
         "steps": logs,
@@ -516,6 +687,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
         "explicit_stop_used": explicit_stop_used,
         "forced_stop_used": forced_stop_used,
         "explicit_terminal_action": explicit_terminal_action,
+        "null_branch": null_branch_record,
     }
     out["state"].setdefault("metrics", {})
     out["state"]["metrics"]["fallback_stop_was_used"] = int(fallback_stop_was_used)
@@ -523,5 +695,8 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
     out["state"]["metrics"]["forced_stop_used"] = int(forced_stop_used)
     out["state"]["metrics"]["explicit_terminal_action"] = (
         int(explicit_terminal_action) if explicit_terminal_action is not None else -1
+    )
+    out["state"]["metrics"]["parametric_hallucination_risk"] = int(
+        bool(null_branch_record.get("parametric_hallucination_risk", False))
     )
     return state.final_answer, out
