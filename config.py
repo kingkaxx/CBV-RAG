@@ -4,7 +4,8 @@ from pathlib import Path
 LLM_MODEL_ID = "/scratch/yl258/kp759/hf/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
 RERANKER_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-reranker-large-local"
 EMBEDDING_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-large-en-v1.5-local"
-
+NLI_MODEL_ID = "./model_cache/nli-deberta-v3-small/"
+HF_LOCAL_FILES_ONLY = False
 
 LLM_DEVICE = "cuda:0"
 RERANKER_DEVICE = "cuda:0"
