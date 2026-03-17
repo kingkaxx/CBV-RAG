@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Local caches
+cache/
+huggingface_cache/
+.huggingface/
+*.lock
+
+# Training / evaluation artifacts
+checkpoints/
+outputs/
+results/
+logs/
+
+# Generated data / indexes
+data/global_index/
+data/index/
+data/kb/
+data/traces/
+data/qa/
+data/*.jsonl
+data/*.json
+
+# Keep optional docs if you add them later
+!data/README.md
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / accidental files
+*.pem
+*.key
+*.pub
+eval "$(ssh-agent -s)"
+eval "$(ssh-agent -s)".pub
+__pycache__/
+*.pyc
+
+cache/
+checkpoints/
+huggingface_cache/
+outputs/
+results/
+logs/
+data/index/
+data/global_index/
+data/kb/

@@ -1,0 +1,13 @@
+{
+  "traces": "data/traces/hotpotqa_100/train.jsonl",
+  "out": "checkpoints/policy_il_100_e10.pt",
+  "epochs": 10,
+  "batch_size": 64,
+  "lr": 0.001,
+  "seed": 42,
+  "policy_type": "mlp",
+  "hidden_dim": 128,
+  "num_layers": 2,
+  "dropout": 0.0,
+  "history_len": 1
+}

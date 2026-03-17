@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from collections import deque
+from typing import Any, Dict, Iterable, List, Optional
+
+import torch
+
+from rl.policy import build_policy, policy_config_from_checkpoint
+from cbvrag.actions import ACTION_ENUM_VERSION, Action, action_names
+from cbvrag.features import FEATURE_SCHEMA_VERSION
+
+
+
+def _validate_checkpoint_compat(ckpt: Dict[str, Any], cfg: Any) -> None:
+    expected_act_dim = len(Action)
+    if int(cfg.act_dim) != expected_act_dim:
+        raise ValueError(
+            "Policy checkpoint/action mismatch: "
+            f"checkpoint act_dim={cfg.act_dim}, runtime Action enum size={expected_act_dim}. "
+            "This usually means the checkpoint was trained with an older action set; re-run trace prep and training."
+        )
+
+    ckpt_schema = ckpt.get("feature_schema_version")
+    if ckpt_schema != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            "Feature schema mismatch: "
+            f"checkpoint has {ckpt_schema!r}, runtime expects {FEATURE_SCHEMA_VERSION!r}."
+        )
+
+    ckpt_action_enum_version = ckpt.get("action_enum_version")
+    if ckpt_action_enum_version != ACTION_ENUM_VERSION:
+        raise ValueError(
+            "Action enum version mismatch: "
+            f"checkpoint has {ckpt_action_enum_version!r}, runtime expects {ACTION_ENUM_VERSION!r}."
+        )
+
+    ckpt_action_names = ckpt.get("action_names")
+    current_names = action_names()
+    if not isinstance(ckpt_action_names, list):
+        raise ValueError("Checkpoint missing required action_names metadata.")
+    if len(ckpt_action_names) != len(current_names):
+        raise ValueError(
+            "Action-name length mismatch: "
+            f"checkpoint has {len(ckpt_action_names)} names, runtime expects {len(current_names)}."
+        )
+    if list(ckpt_action_names) != current_names:
+        raise ValueError(
+            "Action-name order mismatch between checkpoint and current Action enum. "
+            f"checkpoint={ckpt_action_names}, runtime={current_names}"
+        )
+
+
+class LearnedController:
+    def __init__(self, policy_ckpt: str, mode: str = "greedy") -> None:
+        if mode not in {"greedy", "sample"}:
+            raise ValueError("mode must be one of {'greedy', 'sample'}")
+        self.mode = mode
+        self.trace: List[Dict[str, Any]] = []
+        self.ckpt = torch.load(policy_ckpt, map_location="cpu")
+        cfg = policy_config_from_checkpoint(self.ckpt)
+        _validate_checkpoint_compat(self.ckpt, cfg)
+        self.history_len = max(1, cfg.history_len)
+        self.expected_obs_dim = int(cfg.obs_dim)
+        self._debug_print_limit = 8
+        self._history: deque[list[float]] = deque(maxlen=self.history_len)
+        self.model = build_policy(cfg)
+        self.model.load_state_dict(self.ckpt["state_dict"])
+        self.model.eval()
+
+    def reset(self) -> None:
+        self.trace.clear()
+        self._history.clear()
+
+    def _build_model_input(self, obs: Iterable[float]) -> torch.Tensor:
+        obs_list = list(obs)
+        if len(obs_list) < self.expected_obs_dim:
+            obs_list = obs_list + [0.0] * (self.expected_obs_dim - len(obs_list))
+        elif len(obs_list) > self.expected_obs_dim:
+            obs_list = obs_list[: self.expected_obs_dim]
+        self._history.append(obs_list)
+        if len(self._history) < self.history_len:
+            while len(self._history) < self.history_len:
+                self._history.appendleft(obs_list)
+        stacked = torch.tensor(list(self._history), dtype=torch.float32)
+        if stacked.dim() == 2:
+            return stacked.unsqueeze(0)
+        return stacked
+
+    def act(self, obs, state: Any, action_mask: Optional[List[bool]] = None) -> int:
+        inp = self._build_model_input(obs)
+        if inp.dim() == 3 and not hasattr(self.model, "gru"):
+            logits = self.model(inp[:, -1, :])
+        else:
+            logits = self.model(inp)
+
+        logits = logits.squeeze(0)
+        if action_mask is not None:
+            if len(action_mask) != logits.shape[-1]:
+                raise ValueError("action_mask length does not match action dimension")
+            mask = torch.tensor(action_mask, dtype=torch.bool)
+            logits = logits.masked_fill(~mask, float("-inf"))
+
+        if self.mode == "sample":
+            probs = torch.softmax(logits, dim=-1)
+            action = int(torch.multinomial(probs, 1).item())
+        else:
+            action = int(torch.argmax(logits).item())
+
+        action_name = Action(action).name if 0 <= action < len(Action) else f"INVALID_{action}"
+        if len(self.trace) < self._debug_print_limit:
+            print(
+                f"[LearnedController][debug] step={state.step} mode={self.mode} action_idx={action} action={action_name}",
+                flush=True,
+            )
+
+        self.trace.append({"obs": list(obs), "action": action, "reward": 0.0, "done": False, "info": {"action_name": action_name, "step": state.step}})
+        return action
