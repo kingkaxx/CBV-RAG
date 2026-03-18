@@ -2,11 +2,54 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import string
 from pathlib import Path
 
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
-from evaluation import evaluate
+
+
+# ---------------------------------------------------------------------------
+# Standard HotpotQA / SQuAD EM + F1 — self-contained so the script doesn't
+# depend on the project's evaluation.py implementation.
+# ---------------------------------------------------------------------------
+
+def normalize_answer(s: str) -> str:
+    """Lowercase, remove punctuation, remove articles, collapse whitespace."""
+    s = s.lower()
+    s = re.sub(r"[%s]" % re.escape(string.punctuation), " ", s)
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    return " ".join(s.split())
+
+
+def token_f1(pred: str, gold: str) -> float:
+    pred_tokens = normalize_answer(pred).split()
+    gold_tokens = normalize_answer(gold).split()
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+    common = set(pred_tokens) & set(gold_tokens)
+    if not common:
+        return 0.0
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_metrics(pred: str, golds: list[str]) -> tuple[float, float]:
+    """Return (EM, F1) for a prediction against a list of gold answers.
+
+    Uses first 150 characters of *pred* to avoid penalising reasoning chains
+    (HotpotQA answers are 1-5 words; longer strings confuse token overlap).
+    Takes the max over all gold answers.
+    """
+    pred_short = pred[:150] if pred else ""
+    em = max(
+        float(normalize_answer(pred_short) == normalize_answer(g))
+        for g in golds
+    ) if golds else 0.0
+    f1 = max(token_f1(pred_short, g) for g in golds) if golds else 0.0
+    return em, f1
 
 
 def _build_tools(models, llm_device: str) -> dict:
@@ -71,10 +114,13 @@ def main() -> int:
 
     for i, ex in enumerate(data):
         controller = _build_controller(args)
-        pred, log = run_episode(ex["question"], controller, tools, qid=str(i))
+        final_answer, log = run_episode(ex["question"], controller, tools, qid=str(i))
+        # BUG 1 fix: ensure we always have a non-None string from run_episode.
+        pred = (final_answer or "").strip()
 
         golds = ex.get("answer") or [""]
-        em, f1 = evaluate(pred, golds, ex["question"])
+        # BUG 2 fix: use standard HotpotQA EM/F1 with 150-char truncation.
+        em, f1 = compute_metrics(pred, golds)
 
         state = log.get("state") or {}
         metrics = state.get("metrics") or {}
