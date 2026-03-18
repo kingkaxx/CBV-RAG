@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 
+from cbvrag.actions import get_num_actions
 from cbvrag.controller_trace_mixture import TraceMixtureController
 from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
 from cbvrag.evidence_specificity import score_evidence_specificity
@@ -65,6 +67,62 @@ def _maybe_clear_temp_index(retriever: KnowledgeBaseRetriever) -> None:
             retriever.temp_documents = []
     except Exception:
         pass
+
+
+def _validate_traces(output_path: Path) -> None:
+    """Print validation statistics for the written JSONL file.
+
+    Checks:
+    - Total episodes written
+    - Unique qids
+    - Records per qid (must be exactly 1.0)
+    - Action value range (min, max — must be within 0..num_actions-1)
+    - Mean episode_attr_score
+    - Mean trajectory_score
+    - % terminal_correct
+    """
+    num_actions = get_num_actions()
+    records_by_qid: dict[str, int] = defaultdict(int)
+    all_action_values: list[int] = []
+    attr_scores: list[float] = []
+    traj_scores: list[float] = []
+    correct_flags: list[float] = []
+
+    with output_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            qid = rec.get("qid", "")
+            records_by_qid[qid] += 1
+            for step in rec.get("trajectory", []):
+                all_action_values.append(int(step.get("action", -1)))
+            attr_scores.append(float(rec.get("episode_attr_score", 0.0)))
+            traj_scores.append(float(rec.get("trajectory_score", 0.0)))
+            correct_flags.append(1.0 if rec.get("terminal_correct") else 0.0)
+
+    total_episodes = sum(records_by_qid.values())
+    unique_qids = len(records_by_qid)
+    records_per_qid = total_episodes / unique_qids if unique_qids else 0.0
+    action_min = min(all_action_values) if all_action_values else -1
+    action_max = max(all_action_values) if all_action_values else -1
+    n = max(1, len(attr_scores))
+
+    print("\n--- Trace Validation ---")
+    print(f"  Total episodes written : {total_episodes}")
+    print(f"  Unique qids            : {unique_qids}")
+    print(f"  Records per qid        : {records_per_qid:.1f}  (must be 1.0)")
+    print(f"  Action value range     : [{action_min}, {action_max}]  (valid: [0, {num_actions - 1}])")
+    print(f"  Mean episode_attr_score: {sum(attr_scores) / n:.4f}")
+    print(f"  Mean trajectory_score  : {sum(traj_scores) / n:.4f}")
+    print(f"  % terminal_correct     : {100.0 * sum(correct_flags) / n:.1f}%")
+
+    if records_per_qid != 1.0:
+        print("  WARNING: records_per_qid != 1.0 — duplicate or missing episodes detected!")
+    if action_min < 0 or action_max >= num_actions:
+        print(f"  WARNING: action values outside valid range [0, {num_actions - 1}]!")
+    print("------------------------\n")
 
 
 def main() -> int:
@@ -161,39 +219,25 @@ def main() -> int:
             episode_attr_score = float(attr_result.get("attr", 0.0))
 
             # Token usage for this episode (sum over all steps).
-            state_dict = (log.get("state") or {})
-            evidence_pool_dict = state_dict.get("evidence_pool") or {}
-            selected_ids = state_dict.get("selected_evidence_ids") or []
             step_logs = log.get("steps", [])
             episode_tokens = sum(
                 int((s.get("costs") or {}).get("tokens_used_this_step", 0))
                 for s in step_logs
             )
 
-            class SimpleEvidence:
-                def __init__(self, evidence_id: str, payload: dict):
-                    self.evidence_id = evidence_id
-                    self.doc_id = payload.get("doc_id", "")
-                    self.title = payload.get("title", "")
-                    self.rerank_score = float(payload.get("rerank_score", 0.0))
-                    self.retriever_score = float(payload.get("retriever_score", 0.0))
-
-            evs = [SimpleEvidence(eid, payload) for eid, payload in evidence_pool_dict.items()]
-            cluster_stats = summarize_cluster_stats(cluster_evidence_items(evs, selected_ids=selected_ids))
-            specificity_summary = score_evidence_specificity(ex["question"], evs, selected_ids=selected_ids)["summary"]
-
+            # Build the episode-level trajectory list — one entry per step.
+            trajectory = []
             for t, tr in enumerate(controller.trace):
                 step_info = step_logs[t] if t < len(step_logs) else {}
 
                 if args.use_attr_reward:
-                    # Build a synthetic row that shape_reward_with_attr can consume.
                     synthetic_row = {
                         "terminal_correct": bool(correct),
                         "step_info": step_info,
                         "attr_score": episode_attr_score,
                         "t": t,
                     }
-                    row_reward = shape_reward_with_attr(
+                    step_reward = shape_reward_with_attr(
                         synthetic_row,
                         lambda_token=args.attr_lambda_token,
                         lambda_step=args.attr_lambda_step,
@@ -201,28 +245,30 @@ def main() -> int:
                         token_budget=args.token_budget,
                     )
                 else:
-                    row_reward = float(step_info.get("costs", {}).get("new_branch_created", 0) * 0.01)
+                    step_reward = float((step_info.get("costs") or {}).get("new_branch_created", 0) * 0.01)
 
-                row = {
-                    "qid": qid,
+                trajectory.append({
                     "t": t,
                     "obs": tr["obs"],
                     "action": tr["action"],
-                    "reward": row_reward,
-                    "done": t == len(controller.trace) - 1,
-                    "terminal_correct": bool(correct),
-                    "trajectory_score": traj_score,
-                    # Store Attr score so downstream offline-RL can re-use it.
+                    "reward": step_reward,
                     "attr_score": episode_attr_score,
-                    "question": ex["question"],
-                    "pred": pred,
-                    "gold_answers": golds,
                     "step_info": step_info,
-                    "trace_info": tr.get("info", {}),
-                    "cluster_stats": cluster_stats,
-                    "specificity_summary": specificity_summary,
-                }
-                f.write(json.dumps(row) + "\n")
+                })
+
+            # One record per episode — exactly one line per unique qid.
+            episode_record = {
+                "qid": qid,
+                "question": ex["question"],
+                "gold_answers": golds,
+                "trajectory": trajectory,
+                "terminal_correct": bool(correct),
+                "trajectory_score": traj_score,
+                "total_tokens": episode_tokens,
+                "episode_attr_score": episode_attr_score,
+                "num_steps": len(trajectory),
+            }
+            f.write(json.dumps(episode_record) + "\n")
 
             # Accumulate summary stats once per episode (at episode boundary).
             summary_em.append(1.0 if correct else 0.0)
@@ -242,6 +288,10 @@ def main() -> int:
         "mean_attr_score": float(sum(summary_attr) / n),
     }
     print(json.dumps(summary, indent=2))
+
+    # Validate the written file and print a diagnostics report.
+    _validate_traces(output)
+
     return 0
 
 
