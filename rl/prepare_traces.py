@@ -6,13 +6,18 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from cbvrag.actions import Action
 
 
 def load_rows(path: Path) -> List[Dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _is_episode_format(rows: List[Dict]) -> bool:
+    """Return True if *rows* are in the new episode-level format from collect_traces.py."""
+    return bool(rows) and "trajectory" in rows[0]
 
 
 def _step_sort_key(row: Dict) -> tuple[int, int]:
@@ -85,6 +90,127 @@ def _warn_terminal_action_disappearance(kept_terminal_hist: Dict[str, int], trai
                 flush=True,
             )
 
+def _episode_passes_new(ep: Dict, args: argparse.Namespace) -> bool:
+    """Filter predicate for episode-level records (new format)."""
+    if args.only_successful and not bool(ep.get("terminal_correct", False)):
+        return False
+    traj_score = float(ep.get("trajectory_score", 0.0))
+    if args.filter_min_trajectory_score is not None and traj_score < args.filter_min_trajectory_score:
+        return False
+    if args.min_episode_reward is not None and traj_score < args.min_episode_reward:
+        return False
+    if args.max_episode_tokens is not None and int(ep.get("total_tokens", 0)) > args.max_episode_tokens:
+        return False
+    return True
+
+
+def _flatten_episode(ep: Dict) -> List[Dict]:
+    """Convert one episode record into a list of step rows for train_il.py."""
+    qid = str(ep.get("qid", "unknown"))
+    traj_score = float(ep.get("trajectory_score", 0.0))
+    terminal_correct = bool(ep.get("terminal_correct", False))
+    episode_attr_score = float(ep.get("episode_attr_score", 0.0))
+    num_steps = int(ep.get("num_steps", len(ep.get("trajectory", []))))
+    last_t = num_steps - 1
+
+    rows: List[Dict] = []
+    for step in ep.get("trajectory", []):
+        t = int(step.get("t", 0))
+        rows.append({
+            "qid": qid,
+            "obs": step["obs"],
+            "action": step["action"],
+            "reward": step["reward"],
+            "trajectory_score": traj_score,
+            "terminal_correct": terminal_correct,
+            "episode_attr_score": episode_attr_score,
+            "done": t == last_t,
+        })
+    return rows
+
+
+def _process_episode_format(rows: List[Dict], args: argparse.Namespace, out_dir: Path) -> int:
+    """Handle the new episode-level trace format end-to-end.
+
+    Steps:
+    1. Apply episode-level filters.
+    2. Optionally cap traces per qid.
+    3. Split by qid (train/val) BEFORE flattening to prevent leakage.
+    4. Flatten each episode's trajectory into step rows.
+    5. Write train.jsonl, val.jsonl, summary.json.
+
+    Returns 0 on success.
+    """
+    total_episodes = len(rows)
+    kept: List[Dict] = []
+    filtered_episodes = 0
+    for ep in rows:
+        if _episode_passes_new(ep, args):
+            kept.append(ep)
+        else:
+            filtered_episodes += 1
+
+    # Optional: cap traces per qid (keep highest trajectory_score ones).
+    if args.max_traces_per_qid is not None:
+        by_qid: Dict[str, List[Dict]] = defaultdict(list)
+        for ep in kept:
+            by_qid[str(ep.get("qid", "unknown"))].append(ep)
+        capped: List[Dict] = []
+        for eps_for_qid in by_qid.values():
+            eps_for_qid.sort(key=lambda e: float(e.get("trajectory_score", 0.0)), reverse=True)
+            capped.extend(eps_for_qid[: max(1, args.max_traces_per_qid)])
+        kept = capped
+
+    # Split by qid BEFORE flattening.
+    all_qids = sorted({str(ep.get("qid", "unknown")) for ep in kept})
+    train_qids, val_qids = split_qids(all_qids, args.val_ratio, args.seed)
+
+    train_eps = [ep for ep in kept if str(ep.get("qid", "unknown")) in train_qids]
+    val_eps = [ep for ep in kept if str(ep.get("qid", "unknown")) in val_qids]
+
+    # Flatten each episode's trajectory into step rows.
+    train_rows: List[Dict] = []
+    for ep in train_eps:
+        train_rows.extend(_flatten_episode(ep))
+
+    val_rows: List[Dict] = []
+    for ep in val_eps:
+        val_rows.extend(_flatten_episode(ep))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "train.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in train_rows) + ("\n" if train_rows else ""),
+        encoding="utf-8",
+    )
+    (out_dir / "val.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in val_rows) + ("\n" if val_rows else ""),
+        encoding="utf-8",
+    )
+
+    kept_scores = [float(ep.get("trajectory_score", 0.0)) for ep in kept]
+    mean_traj_score = mean(kept_scores) if kept_scores else 0.0
+    pct_terminal_correct = (
+        100.0 * sum(1 for ep in kept if bool(ep.get("terminal_correct", False))) / len(kept)
+        if kept else 0.0
+    )
+
+    summary = {
+        "total_episodes": total_episodes,
+        "kept_episodes": len(kept),
+        "filtered_episodes": filtered_episodes,
+        "train_episodes": len(train_eps),
+        "val_episodes": len(val_eps),
+        "train_steps": len(train_rows),
+        "val_steps": len(val_rows),
+        "mean_trajectory_score": round(mean_traj_score, 6),
+        "pct_terminal_correct": round(pct_terminal_correct, 2),
+    }
+    summary_path = out_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -102,6 +228,12 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = load_rows(Path(args.input))
+
+    # Detect format and branch.
+    if _is_episode_format(rows):
+        return _process_episode_format(rows, args, Path(args.output_dir))
+
+    # ---- Legacy step-level format (unchanged below) ----
     episodes = build_episode_groups(rows)
 
     kept_episodes: Dict[str, List[Dict]] = {}
