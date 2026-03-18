@@ -106,7 +106,7 @@ class HeuristicController:
         self.trace.append(
             {
                 "obs": list(obs),
-                "action": int(action),
+                "action": action.value,
                 "reward": 0.0,
                 "done": False,
                 "info": {
@@ -120,4 +120,4 @@ class HeuristicController:
                 },
             }
         )
-        return int(action)
+        return action.value

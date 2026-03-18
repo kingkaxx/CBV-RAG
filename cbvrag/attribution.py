@@ -34,6 +34,7 @@ on the NLI model's classification head.
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from typing import List, Optional
 
@@ -43,6 +44,18 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 _NLI_MODEL_ID = "microsoft/deberta-large-mnli"
+
+# Question words that are stripped when converting a raw query into an NLI
+# hypothesis (used when no explicit answer_text is available).
+_QUESTION_WORD_RE = re.compile(
+    r"^(who|what|where|when|why|how|is|are|was|were|did|does)\s+",
+    re.IGNORECASE,
+)
+
+
+def _query_to_hypothesis(query: str) -> str:
+    """Strip leading question words from *query* to produce a hypothesis string."""
+    return _QUESTION_WORD_RE.sub("", query).strip()
 _EPS = 1e-8
 
 # Module-level singletons — loaded lazily so that importing this module does
@@ -135,21 +148,26 @@ def grounded_directness(
     query: str,
     docs: List[str],
     device: str = "cpu",
+    answer_text: Optional[str] = None,
 ) -> float:
     """Compute the **GD** (Grounded Directness) component of the Attr score.
 
     GD measures how strongly the retrieved document set *D* entails a claim
-    derived from the query *q*.  We use the query itself as the hypothesis
-    (i.e., we ask: "do these documents entail that the query premise is true?"),
-    which is a well-defined NLI framing — the model answers whether the
-    documents directly support the query statement.
+    derived from the query *q*.
+
+    The NLI hypothesis is chosen as follows:
+
+    * If *answer_text* is provided (the model's predicted answer), it is used
+      directly as the hypothesis — this is more precise than the raw question.
+    * Otherwise, leading question words (Who/What/Where/When/Why/How/Is/Are/
+      Was/Were/Did/Does) are stripped from *query* and the remainder is used.
 
     Implementation
     --------------
-    For each document ``d`` in *D* we compute P(entailment | d, q) using the
-    DeBERTa-large-MNLI model.  GD is the *maximum* over all documents:
+    For each document ``d`` in *D* we compute P(entailment | d, hypothesis)
+    using the DeBERTa-large-MNLI model.  GD is the *maximum* over all documents:
 
-        GD(q, D) = max_{d ∈ D} P(entailment | d, q)
+        GD(q, D) = max_{d ∈ D} P(entailment | d, hypothesis)
 
     Taking the maximum (rather than the mean) reflects the RAG setting where
     a *single* highly relevant passage is sufficient to ground the answer.
@@ -157,18 +175,23 @@ def grounded_directness(
     Parameters
     ----------
     query:
-        The original user question / claim hypothesis.
+        The original user question (used to derive the hypothesis when
+        *answer_text* is ``None``).
     docs:
         Retrieved document passages (plain text strings).
     device:
         Torch device string (default ``"cpu"``).
+    answer_text:
+        Optional predicted answer string.  When provided it is used directly
+        as the NLI hypothesis instead of the stripped query.
 
     Returns
     -------
     float
         GD score in [0, 1].  Higher is better (stronger grounding).
     """
-    return _max_entailment(docs, hypothesis=query, device=device)
+    hypothesis = answer_text if answer_text is not None else _query_to_hypothesis(query)
+    return _max_entailment(docs, hypothesis=hypothesis, device=device)
 
 
 def parametric_stability(
@@ -177,6 +200,7 @@ def parametric_stability(
     counterfactual_queries: List[str],
     device: str = "cpu",
     eps: float = _EPS,
+    answer_text: Optional[str] = None,
 ) -> float:
     """Compute the **PS** (Parametric Stability) component of the Attr score.
 
@@ -213,6 +237,9 @@ def parametric_stability(
     eps:
         Small constant added to the denominator to prevent division by zero
         (default ``1e-8``).
+    answer_text:
+        Optional predicted answer string.  When provided it is used as the
+        hypothesis for ``ent(D, q)`` instead of the stripped query.
 
     Returns
     -------
@@ -222,7 +249,8 @@ def parametric_stability(
     if not counterfactual_queries or not docs:
         return 1.0
 
-    ent_original = _max_entailment(docs, hypothesis=query, device=device)
+    hypothesis = answer_text if answer_text is not None else _query_to_hypothesis(query)
+    ent_original = _max_entailment(docs, hypothesis=hypothesis, device=device)
     ent_max_counter = max(
         _max_entailment(docs, hypothesis=cq, device=device)
         for cq in counterfactual_queries
@@ -240,6 +268,7 @@ def compute_attr(
     counterfactual_queries: List[str],
     alpha: float = 0.5,
     device: str = "cpu",
+    answer_text: Optional[str] = None,
 ) -> dict:
     """Compute the composite **Attr** attribution score.
 
@@ -265,6 +294,11 @@ def compute_attr(
         * ``alpha = 0.5`` (default) → equal weight.
     device:
         Torch device string passed to the NLI model (default ``"cpu"``).
+    answer_text:
+        Optional predicted answer string.  When provided it is used as the
+        NLI hypothesis for both the GD and PS components instead of the
+        stripped query.  Pass the model's predicted answer (``pred`` field)
+        for more precise attribution scoring.
 
     Returns
     -------
@@ -297,8 +331,8 @@ def compute_attr(
             "num_counterfactuals": len(counterfactual_queries),
         }
 
-    gd = grounded_directness(query, docs, device=device)
-    ps = parametric_stability(query, docs, counterfactual_queries, device=device)
+    gd = grounded_directness(query, docs, device=device, answer_text=answer_text)
+    ps = parametric_stability(query, docs, counterfactual_queries, device=device, answer_text=answer_text)
     attr = alpha * gd + (1.0 - alpha) * ps
 
     logger.debug(

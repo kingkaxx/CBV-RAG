@@ -370,6 +370,7 @@ def arbitrate_null_branch(
     counterfactual_queries: Optional[List[str]] = None,
     alpha: float = 0.5,
     attr_device: str = "cpu",
+    answer_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compare the null branch against evidence-grounded branches using Attr score.
 
@@ -414,6 +415,7 @@ def arbitrate_null_branch(
         counterfactual_queries=counterfactual_queries,
         alpha=alpha,
         device=attr_device,
+        answer_text=answer_text if answer_text is not None else grounded_answer,
     )
 
     threshold = float(null_branch.get("null_branch_threshold", 0.3))
@@ -674,6 +676,7 @@ def run_episode(question: str, controller: Any, tools: Dict[str, Any], budgets: 
             docs=grounded_docs,
             query=question,
             counterfactual_queries=counterfactual_queries,
+            answer_text=state.final_answer,
         )
     except Exception as exc:  # pragma: no cover
         logger.warning("Null-branch arbitration failed (non-fatal): %s", exc)

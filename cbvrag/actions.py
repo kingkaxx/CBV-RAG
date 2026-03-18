@@ -1,3 +1,4 @@
+import os
 from enum import IntEnum
 
 
@@ -18,5 +19,17 @@ class Action(IntEnum):
     STOP_AND_ANSWER = 10
 
 
+def get_num_actions() -> int:
+    """Return the total number of discrete actions in the Action enum."""
+    return len(Action)
+
+
 def action_names() -> list[str]:
     return [a.name for a in Action]
+
+
+if os.environ.get("CBVRAG_DEBUG_ACTIONS"):
+    print(
+        "[cbvrag.actions] Action enum members (sorted by value):",
+        sorted([(a.name, a.value) for a in Action], key=lambda x: x[1]),
+    )
