@@ -124,7 +124,10 @@ def shape_reward_with_attr(
 
     num_steps = int(row.get("t", 0)) + 1  # 1-indexed
 
-    attr_score = float(row.get("attr_score", 0.0))
+    # Support both the old per-step key ("attr_score") written by collect_traces.py
+    # when --use_attr_reward is set, and the new episode-level key ("episode_attr_score")
+    # written into flattened step rows by prepare_traces.py _flatten_episode().
+    attr_score = float(row.get("attr_score") or row.get("episode_attr_score") or 0.0)
 
     reward = (
         em_score
@@ -273,6 +276,26 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+
+    # Auto-enable use_attr_shaping when any Attr shaping param is set to a
+    # non-default value but --use_attr_shaping was not explicitly passed.
+    # This prevents the silent bug where --attr_bonus / --lambda_token /
+    # --lambda_step are provided but shaping stays disabled.
+    _attr_param_defaults = {"lambda_token": 0.1, "lambda_step": 0.05, "attr_bonus": 0.2, "token_budget": 4096}
+    _user_set_attr_param = any(
+        getattr(args, k) != default for k, default in _attr_param_defaults.items()
+    )
+    if _user_set_attr_param and not args.use_attr_shaping:
+        print(json.dumps({
+            "event": "auto_enable_attr_shaping",
+            "reason": (
+                "One or more Attr shaping params (--attr_bonus, --lambda_token, "
+                "--lambda_step, --token_budget) were set to non-default values "
+                "but --use_attr_shaping was not passed. Enabling automatically."
+            ),
+        }))
+        args.use_attr_shaping = True
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     act_dim = len(Action)
