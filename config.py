@@ -52,8 +52,8 @@ MAX_EVIDENCE_DOCS = 5
 
 PROJECT_ROOT = Path(__file__).parent.absolute()
 
-KNOWLEDGE_BASE_PATH = PROJECT_ROOT / "knowledge_base"
-FAISS_INDEX_PATH = PROJECT_ROOT / "faiss_index"
+KNOWLEDGE_BASE_PATH = PROJECT_ROOT / "data" / "global_index"
+FAISS_INDEX_PATH = PROJECT_ROOT / "data" / "global_index"
 
 SUPPORTED_DOCUMENT_FORMATS = [".txt", ".md", ".pdf", ".docx", ".json"]
 
