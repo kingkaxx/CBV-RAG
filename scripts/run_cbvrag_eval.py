@@ -103,16 +103,31 @@ def main() -> int:
     # Runtime
     ap.add_argument("--llm_device", default="cuda:0")
     ap.add_argument("--num_samples", type=int, default=None)
+    ap.add_argument(
+        "--use_oracle_context", action="store_true",
+        help=(
+            "Before each episode, build a temporary retrieval index from the "
+            "example's gold 'context' field (same as run_evaluation.py). "
+            "This matches CF-RAG's eval setting where the retriever operates "
+            "over gold supporting documents rather than the global index."
+        ),
+    )
     args = ap.parse_args()
 
     import model_loader
     models = model_loader.load_all_models()
     tools = _build_tools(models, args.llm_device)
+    retriever = tools["retrieve"].retriever  # KnowledgeBaseRetriever instance
     data = load_and_process_data(args.dataset, args.cache_dir, args.num_samples)
 
     per_example_records = []
 
     for i, ex in enumerate(data):
+        if args.use_oracle_context:
+            context_docs = ex.get("context")
+            if context_docs:
+                retriever.build_temp_index_from_docs(context_docs)
+
         controller = _build_controller(args)
         final_answer, log = run_episode(ex["question"], controller, tools, qid=str(i))
         # BUG 1 fix: ensure we always have a non-None string from run_episode.

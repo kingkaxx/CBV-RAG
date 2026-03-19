@@ -1,119 +1,84 @@
+"""Recompute EM and F1 from a .records.jsonl file using evaluation.evaluate().
+
+Usage
+-----
+    python scripts/recompute_metrics.py \
+        --records logs/eval_il_hotpotqa.records.jsonl \
+        --output  logs/eval_il_hotpotqa_fixed.json
+"""
+from __future__ import annotations
+
 import argparse
 import json
-import re
-import string
-from collections import Counter
+import sys
 from pathlib import Path
 
+# evaluation.py lives in the repo root; add it to sys.path if needed.
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-def extract_answer(pred: str) -> str:
-    if not pred:
-        return ""
-    return pred.split("\n")[0].strip()[:150]
-
-
-def normalize_answer(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[%s]" % re.escape(string.punctuation), " ", s)
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
+from evaluation import evaluate  # noqa: E402 (import after sys.path tweak)
 
 
-def token_f1(pred: str, gold: str) -> float:
-    p = normalize_answer(pred).split()
-    g = normalize_answer(gold).split()
-    if not p and not g:
-        return 1.0
-    if not p or not g:
-        return 0.0
-    common = Counter(p) & Counter(g)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    prec = num_same / len(p)
-    rec = num_same / len(g)
-    return 2 * prec * rec / (prec + rec)
-
-
-def compute_em(pred: str, golds: list) -> float:
-    pred_n = normalize_answer(pred)
-    for g in golds:
-        if not g:
-            continue
-        g_n = normalize_answer(str(g))
-        if g_n in pred_n or pred_n in g_n:
-            return 1.0
-    return 0.0
-
-
-def compute_f1(pred: str, golds: list) -> float:
-    return float(max(
-        (token_f1(pred, str(g)) for g in golds if g),
-        default=0.0
-    ))
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--records", required=True)
-    ap.add_argument("--output", required=True)
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Recompute EM/F1 from a .records.jsonl file."
+    )
+    ap.add_argument(
+        "--records", required=True,
+        help="Path to a .records.jsonl file written by run_cbvrag_eval.py.",
+    )
+    ap.add_argument(
+        "--output", required=True,
+        help="Path for the corrected summary JSON.",
+    )
     args = ap.parse_args()
 
-    records = [json.loads(l) for l in open(args.records) if l.strip()]
+    records_path = Path(args.records)
+    records = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
-    em_list, f1_list = [], []
-    tok_list, step_list, attr_list, ret_list, phr_list = [], [], [], [], []
-
+    corrected: list[dict] = []
     for rec in records:
-        raw = (rec.get("prediction") or rec.get("pred") or "").strip()
-        pred = extract_answer(raw)
-        golds = rec.get("gold_answers") or rec.get("golds") or [""]
+        # Use the full prediction string — evaluate() / smart_match() handles
+        # long predictions correctly; no 150-char truncation here.
+        pred = (rec.get("prediction") or rec.get("pred") or "").strip()
+        golds = rec.get("gold_answers") or rec.get("gold") or [""]
         if isinstance(golds, str):
             golds = [golds]
+        question = rec.get("question", "")
 
-        em_list.append(compute_em(pred, golds))
-        f1_list.append(compute_f1(pred, golds))
-        tok_list.append(float(rec.get("total_tokens", rec.get("tokens", 0))))
-        step_list.append(float(rec.get("steps", 0)))
-        attr_list.append(float(rec.get("attr_score", 0)))
-        ret_list.append(float(rec.get("retrieval_calls", 0)))
-        phr_list.append(1.0 if rec.get("parametric_hallucination_risk") else 0.0)
+        em, f1 = evaluate(pred, golds, question)
+        corrected.append({**rec, "em": float(em), "f1": float(f1)})
 
-    n = max(1, len(em_list))
-    result = {
-        "num_examples": n,
-        "mean_em": round(sum(em_list) / n, 4),
-        "mean_f1": round(sum(f1_list) / n, 4),
-        "mean_tokens": round(sum(tok_list) / n, 2),
-        "mean_steps": round(sum(step_list) / n, 3),
-        "mean_attr_score": round(sum(attr_list) / n, 4),
-        "mean_retrieval_calls": round(sum(ret_list) / n, 3),
-        "pct_parametric_hallucination_risk": round(100 * sum(phr_list) / n, 1),
+    n = max(1, len(corrected))
+    summary = {
+        "source_records": str(records_path),
+        "num_examples": len(corrected),
+        "mean_em": sum(r["em"] for r in corrected) / n,
+        "mean_f1": sum(r["f1"] for r in corrected) / n,
+        "mean_tokens": sum(int(r.get("total_tokens", 0)) for r in corrected) / n,
+        "mean_steps": sum(int(r.get("steps", 0)) for r in corrected) / n,
+        "mean_attr_score": sum(float(r.get("attr_score", 0.0)) for r in corrected) / n,
+        "mean_retrieval_calls": sum(int(r.get("retrieval_calls", 0)) for r in corrected) / n,
+        "pct_parametric_hallucination_risk": (
+            100.0 * sum(1 for r in corrected if r.get("parametric_hallucination_risk")) / n
+        ),
+        "per_example_records": corrected,
     }
 
-    Path(args.output).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result, indent=2))
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    printable = {k: v for k, v in summary.items() if k != "per_example_records"}
+    print(json.dumps(printable, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
-
-# Import CF-RAG's smart evaluate function
-import sys
-sys.path.insert(0, '.')
-try:
-    from evaluation import evaluate as cfrag_evaluate
-    HAS_CFRAG_EVAL = True
-except ImportError:
-    HAS_CFRAG_EVAL = False
-
-
-# Import CF-RAG's smart evaluate function
-import sys
-sys.path.insert(0, '.')
-try:
-    from evaluation import evaluate as cfrag_evaluate
-    HAS_CFRAG_EVAL = True
-except ImportError:
-    HAS_CFRAG_EVAL = False
+    raise SystemExit(main())
