@@ -1,4 +1,4 @@
-"""Recompute EM and F1 from a .records.jsonl file using the corrected metric functions.
+"""Recompute EM and F1 from a .records.jsonl file using evaluation.evaluate().
 
 Usage
 -----
@@ -10,51 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import string
+import sys
 from pathlib import Path
 
+# evaluation.py lives in the repo root; add it to sys.path if needed.
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
-# ---------------------------------------------------------------------------
-# Standard HotpotQA / SQuAD EM + F1
-# (identical to the copies in run_cbvrag_eval.py — kept self-contained so
-#  this script can be run independently without importing the eval script)
-# ---------------------------------------------------------------------------
-
-def normalize_answer(s: str) -> str:
-    """Lowercase, remove punctuation, remove articles, collapse whitespace."""
-    s = s.lower()
-    s = re.sub(r"[%s]" % re.escape(string.punctuation), " ", s)
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
-
-
-def token_f1(pred: str, gold: str) -> float:
-    pred_tokens = normalize_answer(pred).split()
-    gold_tokens = normalize_answer(gold).split()
-    if not pred_tokens or not gold_tokens:
-        return 0.0
-    common = set(pred_tokens) & set(gold_tokens)
-    if not common:
-        return 0.0
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gold_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
-def compute_metrics(pred: str, golds: list[str]) -> tuple[float, float]:
-    """Return (EM, F1) against a list of gold answers.
-
-    Uses first 150 characters of *pred* to avoid penalising reasoning chains.
-    Takes the max over all gold answers.
-    """
-    pred_short = pred[:150] if pred else ""
-    em = max(
-        float(normalize_answer(pred_short) == normalize_answer(g))
-        for g in golds
-    ) if golds else 0.0
-    f1 = max(token_f1(pred_short, g) for g in golds) if golds else 0.0
-    return em, f1
+from evaluation import evaluate  # noqa: E402 (import after sys.path tweak)
 
 
 def main() -> int:
@@ -80,13 +44,16 @@ def main() -> int:
 
     corrected: list[dict] = []
     for rec in records:
+        # Use the full prediction string — evaluate() / smart_match() handles
+        # long predictions correctly; no 150-char truncation here.
         pred = (rec.get("prediction") or rec.get("pred") or "").strip()
         golds = rec.get("gold_answers") or rec.get("gold") or [""]
         if isinstance(golds, str):
             golds = [golds]
+        question = rec.get("question", "")
 
-        em, f1 = compute_metrics(pred, golds)
-        corrected.append({**rec, "em": em, "f1": f1})
+        em, f1 = evaluate(pred, golds, question)
+        corrected.append({**rec, "em": float(em), "f1": float(f1)})
 
     n = max(1, len(corrected))
     summary = {
