@@ -97,3 +97,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Import CF-RAG's smart evaluate function
+import sys
+sys.path.insert(0, '.')
+try:
+    from evaluation import evaluate as cfrag_evaluate
+    HAS_CFRAG_EVAL = True
+except ImportError:
+    HAS_CFRAG_EVAL = False
+
+
+# Import CF-RAG's smart evaluate function
+import sys
+sys.path.insert(0, '.')
+try:
+    from evaluation import evaluate as cfrag_evaluate
+    HAS_CFRAG_EVAL = True
+except ImportError:
+    HAS_CFRAG_EVAL = False
