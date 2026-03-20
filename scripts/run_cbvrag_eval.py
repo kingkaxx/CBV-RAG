@@ -15,16 +15,17 @@ import evaluation
 # ---------------------------------------------------------------------------
 # Answer extraction — applied BEFORE EM/F1 scoring
 # ---------------------------------------------------------------------------
-
 def extract_answer(pred: str) -> str:
-    """Extract the answer span from a raw LLM output.
+    """Extract a concise answer span from a raw LLM output.
 
-    Handles three output formats produced by answer_prompt():
-      1. Clean: "Paris"
-      2. With reasoning suffix: "Paris\nReasoning: ..."
-      3. With Answer: prefix repeated: "Answer: Paris\nReasoning: ..."
+    Handles common answer_prompt() outputs such as:
+      1. "Paris"
+      2. "Paris\nReasoning: ..."
+      3. "Answer: Paris\nReasoning: ..."
+      4. "Kevin Spacey. or None."
+      5. "Ride a Wild Pony. (Note that there are two...)"
 
-    Returns the shortest clean answer string for EM comparison.
+    Returns the shortest clean answer string for EM/F1 comparison.
     """
     if not pred:
         return ""
@@ -36,8 +37,9 @@ def extract_answer(pred: str) -> str:
     pred = re.split(r"\n\s*(reasoning|explanation)\s*:", pred, maxsplit=1, flags=re.IGNORECASE)[0]
     pred = re.split(r"\n\s*answer\s*:", pred, maxsplit=1, flags=re.IGNORECASE)[0]
 
-    # Take the first non-empty line
-    for line in pred.split("\n"):
+    # Take first non-empty line
+    first = ""
+    for line in pred.splitlines():
         line = line.strip()
         if line:
             line = re.sub(r"^[\"'`\(\[]+", "", line)
@@ -45,13 +47,40 @@ def extract_answer(pred: str) -> str:
             line = re.sub(r"[.!?]+$", "", line).strip()
             return line
 
-    return pred.strip()
+    # Remove template placeholders / junk
+    pred = re.sub(r"\[your concise answer[^\]]*\]", "", pred, flags=re.IGNORECASE)
+    pred = re.sub(r"\[one sentence[^\]]*\]", "", pred, flags=re.IGNORECASE)
+
+    # Trim parenthetical commentary
+    pred = re.split(r"\s*\(", pred, maxsplit=1)[0]
+
+    # Trim sentence continuations like:
+    # "Kevin Spacey. or None." -> "Kevin Spacey"
+    pred = re.split(
+        r"\.\s+(?:or|and|but|however|note|this|that|it|in|the)\b",
+        pred,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+    # Trim non-period continuation tails
+    pred = re.split(
+        r"\s+\b(?:however|but|because|although|whereas|note that)\b",
+        pred,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+    # Clean trailing punctuation/quotes
+    pred = pred.strip().strip("\"'`")
+    pred = re.sub(r"[.!?]+$", "", pred).strip()
+
+    return pred
 
 
 # ---------------------------------------------------------------------------
-# Standard HotpotQA / SQuAD EM + F1
+# Standard HotpotQA / SQuAD normalization helpers
 # ---------------------------------------------------------------------------
-
 def normalize_answer(s: str) -> str:
     """Lowercase, remove punctuation, remove articles, collapse whitespace."""
     s = s.lower()
@@ -77,11 +106,14 @@ def token_f1(pred: str, gold: str) -> float:
 def compute_metrics(pred: str, golds: list[str], question: str) -> tuple[float, float]:
     """Return (EM, F1) using extracted answer.
 
-    FIX vs old version:
-    - extract_answer() is applied BEFORE normalization (not 150-char truncation)
-    - same extracted string used for both EM and F1
-    - F1 is now always >= EM (mathematically correct)
+    Key fixes:
+    - extract_answer() is applied BEFORE scoring
+    - smart_exact_match_score() is used for EM
+    - the real question is passed into smart matching
+    - the same extracted string is used for both EM and F1
     """
+    from evaluation import smart_exact_match_score
+
     pred_clean = extract_answer(pred)
     em = max(
         float(evaluation.smart_exact_match_score(pred_clean, g, question))
@@ -116,10 +148,14 @@ def _build_controller(args):
     ct = args.controller_type
     if ct == "heuristic":
         from cbvrag.controller_trace_mixture import TraceMixtureController
+
         return TraceMixtureController()
+
     if not args.policy_ckpt:
         raise ValueError("--policy_ckpt is required for controller_type il/offline")
+
     from cbvrag.controller_learned import LearnedController
+
     return LearnedController(args.policy_ckpt, mode=args.policy_mode)
 
 
@@ -131,8 +167,11 @@ def main() -> int:
     ap.add_argument("--cache_dir", default="./huggingface_cache")
     ap.add_argument("--output", default="logs/cbvrag_eval.json")
     ap.add_argument("--baseline_jsonl", default=None)
-    ap.add_argument("--controller_type", choices=["heuristic", "il", "offline"],
-                    default="heuristic")
+    ap.add_argument(
+        "--controller_type",
+        choices=["heuristic", "il", "offline"],
+        default="heuristic",
+    )
     ap.add_argument("--policy_ckpt", default=None)
     ap.add_argument("--policy_mode", choices=["greedy", "sample"], default="greedy")
     ap.add_argument("--llm_device", default="cuda:0")
@@ -152,6 +191,7 @@ def main() -> int:
     args = ap.parse_args()
 
     import model_loader
+
     models = model_loader.load_all_models()
     tools = _build_tools(models, args.llm_device)
     retriever = tools["retrieve"].retriever
@@ -252,6 +292,7 @@ def main() -> int:
         }
         print(json.dumps({"normal_retrieval": normal_summary, "oracle_context": oracle_summary}, indent=2))
     output_path.write_text(json.dumps(full_out, indent=2), encoding="utf-8")
+
     print(json.dumps(summary, indent=2))
     return 0
 
