@@ -243,6 +243,21 @@ class TraceMixtureController:
 
         return self._pick_weighted(candidates, weights)
 
+    def _filter_state_valid(self, legal, state):
+        """Remove actions invalid for current state."""
+        retrieval_calls = int((state.metrics or {}).get('retrieval_calls', 0))
+        selected_empty = len(state.selected_evidence_ids) == 0
+        from cbvrag.actions import Action as _A
+        invalid = set()
+        if retrieval_calls == 0 or selected_empty:
+            invalid.update([int(_A.SPAWN_COUNTERFACTUAL), int(_A.PRUNE_BRANCH), int(_A.MERGE_BRANCHES)])
+        if selected_empty:
+            invalid.update([int(_A.VERIFY_CHEAP), int(_A.VERIFY_LLM), int(_A.STOP_AND_ANSWER), int(_A.ANSWER_DIRECT), int(_A.SUMMARIZE_STATE)])
+        if retrieval_calls >= 2 and selected_empty:
+            invalid.update([int(_A.RETRIEVE_MORE_SMALL), int(_A.RETRIEVE_MORE_LARGE)])
+        filtered = [a for a in legal if int(a) not in invalid]
+        return filtered if filtered else legal
+
     def _pick_random_legal(self, legal: List[Action], state) -> Action:
         s = self._state_features(state)
 
@@ -273,13 +288,13 @@ class TraceMixtureController:
             mode_roll = self.rng.random()
 
             if heuristic_action not in legal:
-                action = self._pick_random_legal(legal, state)
+                action = self._pick_random_legal(self._filter_state_valid(legal, state), state)
             elif mode_roll < self.heuristic_prob * self._heuristic_bias(s["step"]):
                 action = heuristic_action
             elif mode_roll < self.heuristic_prob * self._heuristic_bias(s["step"]) + self.random_legal_prob:
-                action = self._pick_random_legal(legal, state)
+                action = self._pick_random_legal(self._filter_state_valid(legal, state), state)
             else:
-                action = self._pick_rare_boosted(legal, state)
+                action = self._pick_rare_boosted(self._filter_state_valid(legal, state), state)
 
         self.action_counter[int(action)] += 1
 

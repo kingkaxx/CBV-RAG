@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 def default_budgets() -> Dict[str, int]:
     return {
         "max_steps": 8,
-        "max_context_chunks": 8,
-        "max_context_tokens": 1500,
+        "max_context_chunks": 12,
+        "max_context_tokens": 2500,
         "max_branches": 3,
         "max_retrieval_calls": 5,
     }

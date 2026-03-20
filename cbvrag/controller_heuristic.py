@@ -62,40 +62,43 @@ class HeuristicController:
         max_branches = int(state.budgets.get("max_branches", 3))
         verification_status = state.verification_status
 
-        if step == 0:
+        pool_nonempty = len(state.evidence_pool) > 0
+        selected_nonempty = selected_count > 0
+        verify_calls = self._verification_calls(state)
+
+        # PRIORITY RULE 1: After any retrieval, always select context first
+        if retrieval_calls > 0 and pool_nonempty and not selected_nonempty:
+            action = Action.SELECT_CONTEXT
+
+        # PRIORITY RULE 2: After context selection, always verify before stopping
+        elif selected_nonempty and verification_status == "unknown" and verify_calls == 0:
+            action = Action.VERIFY_CHEAP
+
+        # PRIORITY RULE 3: Strong evidence + verified = stop
+        elif (
+            verification_status == "supported"
+            and selected_count >= 2
+            and unique_title_count >= 2
+        ):
+            action = Action.STOP_AND_ANSWER
+
+        # PRIORITY RULE 4: Need more evidence after first retrieval
+        elif retrieval_calls < 2 and selected_count < 2:
             action = Action.RETRIEVE_MORE_LARGE
-        elif step == 1:
-            action = Action.SELECT_CONTEXT
-        elif step == 2:
-            if selected_count < 2 or unique_title_count < 2:
-                action = Action.RETRIEVE_MORE_LARGE
-            else:
-                action = Action.VERIFY_CHEAP
-        elif step == 3:
-            if (
-                verification_status == "supported"
-                and selected_count >= 2
-                and unique_title_count >= 2
-                and rerank_gap > 0.22
-            ):
-                action = Action.STOP_AND_ANSWER
-            elif retrieval_calls < 2:
-                action = Action.RETRIEVE_MORE_SMALL
-            else:
-                # Branching is fallback: only after verification signal or clearly uncertain evidence.
-                if self._has_verification_signal(state) or rerank_gap < 0.12:
-                    action = Action.SPAWN_COUNTERFACTUAL
-                else:
-                    action = Action.VERIFY_CHEAP
-        elif step == 4:
-            action = Action.SELECT_CONTEXT
-        elif step == 5:
-            if verification_status == "unknown":
-                action = Action.VERIFY_LLM
-            elif verification_status == "contradicted" and branch_count < max_branches:
-                action = Action.SPAWN_COUNTERFACTUAL
-            else:
-                action = Action.STOP_AND_ANSWER
+
+        # PRIORITY RULE 5: Need second retrieval for multi-hop
+        elif retrieval_calls < 2 and unique_title_count < 2:
+            action = Action.RETRIEVE_MORE_SMALL
+
+        # PRIORITY RULE 6: Contradicted — spawn counterfactual branch
+        elif verification_status == "contradicted" and branch_count < max_branches:
+            action = Action.SPAWN_COUNTERFACTUAL
+
+        # PRIORITY RULE 7: Unknown after verification — escalate to LLM verify
+        elif selected_nonempty and verification_status == "unknown" and verify_calls > 0:
+            action = Action.VERIFY_LLM
+
+        # DEFAULT: stop and answer
         else:
             action = Action.STOP_AND_ANSWER
 

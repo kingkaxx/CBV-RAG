@@ -6,12 +6,16 @@ from typing import Iterable
 def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summary: str, global_summary: str) -> str:
     snippets = "\n".join([f"- {s}" for s in selected_snippets])
     return (
-        "Answer the question using only the snippets. Keep it concise.\n"
+        "Answer the question using ONLY the evidence snippets provided. "
+        "Be concise. Do not add information not present in the snippets.\n\n"
         f"Question: {question}\n"
         f"Branch summary: {branch_summary}\n"
         f"Global summary: {global_summary}\n"
-        f"Snippets:\n{snippets}\n"
-        "Final answer:"
+        f"Evidence snippets:\n{snippets}\n\n"
+        "Provide your answer in this exact format:\n"
+        "Answer: [your concise answer here, 1-5 words only]\n"
+        "Reasoning: [one sentence explanation]\n"
+        "Answer:"
     )
 
 

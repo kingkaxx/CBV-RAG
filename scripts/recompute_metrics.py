@@ -9,6 +9,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import sys
 from pathlib import Path
@@ -46,13 +47,22 @@ def main() -> int:
     for rec in records:
         # Use the full prediction string — evaluate() / smart_match() handles
         # long predictions correctly; no 150-char truncation here.
-        pred = (rec.get("prediction") or rec.get("pred") or "").strip()
+        raw_pred = (rec.get("prediction") or rec.get("pred") or "").strip()
+        # Extract answer after 'Answer:' label if present (structured prompt format)
+        answer_match = re.search(r'Answer:\s*(.+?)(?:
+Reasoning:|$)', raw_pred, re.IGNORECASE | re.DOTALL)
+        if answer_match:
+            pred = answer_match.group(1).strip().split('
+')[0].strip()[:150]
+        else:
+            pred = raw_pred.split('\n')[0].strip()[:150]
         golds = rec.get("gold_answers") or rec.get("gold") or [""]
         if isinstance(golds, str):
             golds = [golds]
         question = rec.get("question", "")
 
-        em, f1 = evaluate(pred, golds, question)
+        em, _ = evaluate(pred, golds, question)
+        _, f1 = evaluate(pred.split("\n")[0].strip()[:150], golds, question)
         corrected.append({**rec, "em": float(em), "f1": float(f1)})
 
     n = max(1, len(corrected))
