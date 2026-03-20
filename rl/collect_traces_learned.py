@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
+import string
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +26,35 @@ from retriever import KnowledgeBaseRetriever
 
 
 # ── Reuse helpers from collect_traces ─────────────────────────────────────────
+
+def _normalize(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[%s]" % re.escape(string.punctuation), " ", s)
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    return " ".join(s.split())
+
+
+def _extract_answer(pred: str) -> str:
+    if not pred:
+        return ""
+    pred = re.sub(r"^Answer:\s*", "", pred.strip(), flags=re.IGNORECASE)
+    if "\nReasoning:" in pred:
+        pred = pred.split("\nReasoning:")[0]
+    if "\nAnswer:" in pred:
+        pred = pred.split("\nAnswer:")[0]
+    for line in pred.split("\n"):
+        line = line.strip()
+        if line:
+            return re.sub(r"[.!?]+$", "", line).strip()
+    return pred.strip()
+
+
+def _is_correct(pred: str, golds: list) -> bool:
+    pred_norm = _normalize(_extract_answer(pred))
+    if not pred_norm:
+        return False
+    return any(_normalize(str(g)) == pred_norm for g in golds if str(g).strip())
+
 
 def _trajectory_score(log: dict, correct: bool) -> float:
     state = (log.get("state") or {})
@@ -106,14 +137,12 @@ def _validate_traces(output_path: Path) -> None:
     print("\n--- Trace Validation (DAgger) ---")
     print(f"  Total episodes written : {total_episodes}")
     print(f"  Unique qids            : {unique_qids}")
-    print(f"  Records per qid        : {records_per_qid:.1f}  (must be 1.0)")
+    print(f"  Records per qid        : {records_per_qid:.1f}")
     print(f"  Action value range     : [{action_min}, {action_max}]  (valid: [0, {num_actions - 1}])")
     print(f"  Mean episode_attr_score: {sum(attr_scores) / n:.4f}")
     print(f"  Mean trajectory_score  : {sum(traj_scores) / n:.4f}")
     print(f"  % terminal_correct     : {100.0 * sum(correct_flags) / n:.1f}%")
 
-    if records_per_qid != 1.0:
-        print("  WARNING: records_per_qid != 1.0 — duplicate or missing episodes!")
     if action_min < 0 or action_max >= num_actions:
         print(f"  WARNING: action values outside valid range [0, {num_actions - 1}]!")
     print("---------------------------------\n")
@@ -235,6 +264,9 @@ def main() -> int:
     ap.add_argument("--attr_lambda_step", type=float, default=0.05)
     ap.add_argument("--attr_bonus", type=float, default=0.2)
     ap.add_argument("--token_budget", type=int, default=4096)
+    ap.add_argument("--rollouts_per_example", type=int, default=3)
+    ap.add_argument("--max_correct_per_example", type=int, default=3)
+    ap.add_argument("--max_wrong_per_example", type=int, default=2)
     args = ap.parse_args()
 
     output = Path(args.output or f"data/traces/{args.dataset}_dagger.jsonl")
@@ -265,84 +297,77 @@ def main() -> int:
     with output.open("w", encoding="utf-8") as f:
         for i, ex in enumerate(data):
             qid = str(i)
-
-            _maybe_clear_temp_index(retriever)
-            _maybe_build_temp_index(retriever, ex, qid=qid)
-
-            # Fresh controller per episode
-            controller = LearnedController(
-                policy_path=args.policy,
-                epsilon=args.epsilon,
-                seed=2000 + i,
-            )
-
-            pred, log = run_episode(ex["question"], controller, tools, qid=qid)
-
             golds = ex.get("answer") or [""]
-            pred_norm = pred.strip().lower()
-            correct = any(str(g).strip().lower() in pred_norm for g in golds if str(g).strip())
-            traj_score = _trajectory_score(log, correct)
-
-            null_branch_record = log.get("null_branch") or {}
-            attr_result = null_branch_record.get("attr_score") or {}
-            episode_attr_score = float(attr_result.get("attr", 0.0))
-
-            step_logs = log.get("steps", [])
-            episode_tokens = sum(
-                int((s.get("costs") or {}).get("tokens_used_this_step", 0))
-                for s in step_logs
-            )
-
-            trajectory = []
-            for t, tr in enumerate(controller.trace):
-                step_info = step_logs[t] if t < len(step_logs) else {}
-
-                if args.use_attr_reward:
-                    synthetic_row = {
-                        "terminal_correct": bool(correct),
-                        "step_info": step_info,
-                        "attr_score": episode_attr_score,
+            rollout_records: List[Dict[str, Any]] = []
+            for rollout_idx in range(max(1, args.rollouts_per_example)):
+                _maybe_clear_temp_index(retriever)
+                _maybe_build_temp_index(retriever, ex, qid=qid)
+                controller = LearnedController(
+                    policy_path=args.policy,
+                    epsilon=args.epsilon,
+                    seed=2000 + (i * 101) + rollout_idx,
+                )
+                pred, log = run_episode(ex["question"], controller, tools, qid=f"{qid}:{rollout_idx}")
+                correct = _is_correct(pred, golds)
+                traj_score = _trajectory_score(log, correct)
+                null_branch_record = log.get("null_branch") or {}
+                attr_result = null_branch_record.get("attr_score") or {}
+                episode_attr_score = float(attr_result.get("attr", 0.0))
+                step_logs = log.get("steps", [])
+                episode_tokens = sum(
+                    int((s.get("costs") or {}).get("tokens_used_this_step", 0))
+                    for s in step_logs
+                )
+                trajectory = []
+                for t, tr in enumerate(controller.trace):
+                    step_info = step_logs[t] if t < len(step_logs) else {}
+                    if args.use_attr_reward:
+                        synthetic_row = {
+                            "terminal_correct": bool(correct),
+                            "step_info": step_info,
+                            "attr_score": episode_attr_score,
+                            "t": t,
+                        }
+                        step_reward = shape_reward_with_attr(
+                            synthetic_row,
+                            lambda_token=args.attr_lambda_token,
+                            lambda_step=args.attr_lambda_step,
+                            attr_bonus=args.attr_bonus,
+                            token_budget=args.token_budget,
+                        )
+                    else:
+                        step_reward = float((step_info.get("costs") or {}).get("new_branch_created", 0) * 0.01)
+                    trajectory.append({
                         "t": t,
-                    }
-                    step_reward = shape_reward_with_attr(
-                        synthetic_row,
-                        lambda_token=args.attr_lambda_token,
-                        lambda_step=args.attr_lambda_step,
-                        attr_bonus=args.attr_bonus,
-                        token_budget=args.token_budget,
-                    )
-                else:
-                    step_reward = float(
-                        (step_info.get("costs") or {}).get("new_branch_created", 0) * 0.01
-                    )
-
-                trajectory.append({
-                    "t": t,
-                    "obs": tr["obs"],
-                    "action": tr["action"],
-                    "reward": step_reward,
-                    "attr_score": episode_attr_score,
-                    "step_info": step_info,
+                        "obs": tr["obs"],
+                        "action": tr["action"],
+                        "reward": step_reward,
+                        "attr_score": episode_attr_score,
+                        "step_info": step_info,
+                    })
+                rollout_records.append({
+                    "qid": qid,
+                    "question": ex["question"],
+                    "gold_answers": golds,
+                    "trajectory": trajectory,
+                    "terminal_correct": bool(correct),
+                    "trajectory_score": traj_score,
+                    "total_tokens": episode_tokens,
+                    "episode_attr_score": episode_attr_score,
+                    "num_steps": len(trajectory),
+                    "dagger": True,
+                    "epsilon": args.epsilon,
+                    "rollout_idx": rollout_idx,
                 })
 
-            episode_record = {
-                "qid": qid,
-                "question": ex["question"],
-                "gold_answers": golds,
-                "trajectory": trajectory,
-                "terminal_correct": bool(correct),
-                "trajectory_score": traj_score,
-                "total_tokens": episode_tokens,
-                "episode_attr_score": episode_attr_score,
-                "num_steps": len(trajectory),
-                "dagger": True,
-                "epsilon": args.epsilon,
-            }
-            f.write(json.dumps(episode_record) + "\n")
-
-            summary_em.append(1.0 if correct else 0.0)
-            summary_tokens.append(episode_tokens)
-            summary_attr.append(episode_attr_score)
+            rollout_records.sort(key=lambda r: float(r.get("trajectory_score", 0.0)), reverse=True)
+            correct_rows = [r for r in rollout_records if bool(r.get("terminal_correct", False))][: max(1, args.max_correct_per_example)]
+            wrong_rows = [r for r in rollout_records if not bool(r.get("terminal_correct", False))][: max(0, args.max_wrong_per_example)]
+            for episode_record in (correct_rows + wrong_rows):
+                f.write(json.dumps(episode_record) + "\n")
+                summary_em.append(1.0 if episode_record["terminal_correct"] else 0.0)
+                summary_tokens.append(episode_record["total_tokens"])
+                summary_attr.append(episode_record["episode_attr_score"])
 
     _maybe_clear_temp_index(retriever)
 

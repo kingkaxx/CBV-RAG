@@ -76,9 +76,9 @@ def load_rows(path: str, min_score: Optional[float] = None) -> List[dict]:
 
 def shape_reward_with_attr(
     row: dict,
-    lambda_token: float = 0.1,
-    lambda_step: float = 0.05,
-    attr_bonus: float = 0.2,
+    lambda_token: float = 0.04,
+    lambda_step: float = 0.02,
+    attr_bonus: float = 0.12,
     token_budget: int = 4096,
 ) -> float:
     """Compute the Attr-shaped reward for a single trace row.
@@ -115,7 +115,7 @@ def shape_reward_with_attr(
     float
         The shaped scalar reward for this transition.
     """
-    em_score = 1.0 if bool(row.get("terminal_correct", False)) else 0.0
+    em_score = 2.0 if bool(row.get("terminal_correct", False)) else 0.0
 
     step_info = row.get("step_info") or {}
     costs = step_info.get("costs") or {}
@@ -230,7 +230,7 @@ def main() -> int:
     ap.add_argument(
         "--lambda_token",
         type=float,
-        default=0.1,
+        default=0.04,
         help=(
             "Token efficiency penalty weight in the Attr-shaped reward: "
             "R -= lambda_token * (tokens_used / token_budget). "
@@ -241,7 +241,7 @@ def main() -> int:
     ap.add_argument(
         "--lambda_step",
         type=float,
-        default=0.05,
+        default=0.02,
         help=(
             "Per-step penalty weight: R -= lambda_step * num_steps. "
             "Encourages fewer reasoning steps without sacrificing accuracy."
@@ -250,7 +250,7 @@ def main() -> int:
     ap.add_argument(
         "--attr_bonus",
         type=float,
-        default=0.2,
+        default=0.12,
         help=(
             "Attribution score bonus weight: R += attr_bonus * attr_score. "
             "Rewards the policy for producing well-attributed final answers."
@@ -281,7 +281,7 @@ def main() -> int:
     # non-default value but --use_attr_shaping was not explicitly passed.
     # This prevents the silent bug where --attr_bonus / --lambda_token /
     # --lambda_step are provided but shaping stays disabled.
-    _attr_param_defaults = {"lambda_token": 0.1, "lambda_step": 0.05, "attr_bonus": 0.2, "token_budget": 4096}
+    _attr_param_defaults = {"lambda_token": 0.04, "lambda_step": 0.02, "attr_bonus": 0.12, "token_budget": 4096}
     _user_set_attr_param = any(
         getattr(args, k) != default for k, default in _attr_param_defaults.items()
     )

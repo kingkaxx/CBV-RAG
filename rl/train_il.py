@@ -62,6 +62,7 @@ def _rows_to_tensors(rows: List[dict], act_dim: int) -> Tuple[torch.Tensor, torc
             w += 0.50
         if bool(r.get("done", False)):
             w += 0.10
+        w *= float(r.get("il_weight", 1.0))
         weights.append(max(0.05, float(w)))
 
     sample_w = torch.tensor(weights, dtype=torch.float32)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 
@@ -42,10 +43,13 @@ def select_context_cluster_aware(
     cluster_info: List[Dict[str, Any]] | None = None,
     per_cluster_soft_cap: int = 2,
 ) -> List[Dict[str, Any]]:
-    del question  # Phase-1 selection is evidence-side only.
-
     if not pool:
         return []
+    question_entities = {
+        tok.lower()
+        for tok in re.findall(r"\b[A-Z][a-zA-Z0-9_-]+\b", question or "")
+        if len(tok) > 2
+    }
 
     cluster_lookup = _build_cluster_lookup(pool, cluster_info)
     cluster_selected_count: Dict[str, int] = {}
@@ -56,13 +60,17 @@ def select_context_cluster_aware(
         specificity = float(item.get("specificity", 0.0))
         novelty = float(item.get("novelty", 0.0))
         genericity = float(item.get("genericity", 0.0))
-        base_score = 1.0 * rerank + 0.35 * novelty + 0.25 * specificity - 0.40 * genericity
+        text_l = str(item.get("text", "")).lower()
+        entity_hits = sum(1 for ent in question_entities if ent in text_l)
+        entity_bonus = 0.06 * min(3, entity_hits)
+        base_score = 1.0 * rerank + 0.35 * novelty + 0.25 * specificity - 0.40 * genericity + entity_bonus
         scored.append((base_score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     selected: List[Dict[str, Any]] = []
     used_tokens = 0
+    selected_docs: set[str] = set()
 
     for _, item in scored:
         if len(selected) >= max_chunks:
@@ -88,8 +96,13 @@ def select_context_cluster_aware(
         if already >= per_cluster_soft_cap and adjusted_score < 0.75:
             continue
 
+        doc_key = str(item.get("doc_id", "")).strip().lower()
+        if len(selected) < 2 and selected_docs and doc_key in selected_docs:
+            continue
+
         selected.append(item)
         used_tokens += item_tokens
+        selected_docs.add(doc_key)
         cluster_selected_count[cid] = already + 1
 
     return selected

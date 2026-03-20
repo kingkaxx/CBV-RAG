@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 def default_budgets() -> Dict[str, int]:
     return {
         "max_steps": 8,
-        "max_context_chunks": 12,
+        "max_context_chunks": 14,
         "max_context_tokens": 2500,
         "max_branches": 3,
         "max_retrieval_calls": 5,
+        "final_answer_max_new_tokens": 32,
     }
 
 
@@ -65,7 +66,7 @@ def _selected_snippets(state: EpisodeState, max_items: int | None = None) -> Lis
 def _can_stop_now(state: EpisodeState) -> bool:
     retrieval_calls = int(state.metrics.get("retrieval_calls", 0))
     selected_nonempty = len(state.selected_evidence_ids) > 0
-    return selected_nonempty and (retrieval_calls >= 2 or state.verification_status == "supported")
+    return selected_nonempty and (retrieval_calls >= 1 or state.verification_status == "supported")
 
 
 def _phase1_stats(state: EpisodeState) -> Dict[str, Any]:
@@ -182,11 +183,15 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
     llm = tools["llm"]
 
     if action in (Action.RETRIEVE_MORE_SMALL, Action.RETRIEVE_MORE_LARGE):
-        pool_k = 10 if action == Action.RETRIEVE_MORE_SMALL else 40
+        pool_k = 20 if action == Action.RETRIEVE_MORE_SMALL else 80
         cands = retriever.retrieve(state.question, pool_k)
         state.metrics["retrieval_calls"] += 1
         step_costs["retrieval_calls_this_step"] = 1
-        cands = reranker.rerank(state.question, cands)
+        rerank_top_n = min(len(cands), 48 if action == Action.RETRIEVE_MORE_SMALL else 64)
+        try:
+            cands = reranker.rerank(state.question, cands, top_n=rerank_top_n)
+        except TypeError:
+            cands = reranker.rerank(state.question, cands)[:rerank_top_n]
         state.metrics["rerank_calls"] += 1
         for idx, c in enumerate(cands):
             eid = f"{c['doc_id']}::{c['chunk_id']}::{idx}"
@@ -222,14 +227,23 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
                 }
             )
 
-        selected = select_context(
-            state.question,
-            pool,
-            tokenizer=llm.tokenizer,
-            max_chunks=state.budgets["max_context_chunks"],
-            max_tokens=state.budgets["max_context_tokens"],
-            cluster_info=phase1["cluster_info"],
-        )
+        try:
+            selected = select_context(
+                state.question,
+                pool,
+                tokenizer=llm.tokenizer,
+                max_chunks=state.budgets["max_context_chunks"],
+                max_tokens=state.budgets["max_context_tokens"],
+                cluster_info=phase1["cluster_info"],
+            )
+        except TypeError:
+            selected = select_context(
+                state.question,
+                pool,
+                tokenizer=llm.tokenizer,
+                max_chunks=state.budgets["max_context_chunks"],
+                max_tokens=state.budgets["max_context_tokens"],
+            )
         state.selected_evidence_ids = [s["evidence_id"] for s in selected]
 
     elif action == Action.SPAWN_COUNTERFACTUAL and len(state.branches) < state.budgets["max_branches"]:
@@ -281,7 +295,12 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
         snippets = _selected_snippets(state)
         branch_summary = getattr(state.branches[state.active_branch_id], "summary", "")
         prompt = answer_prompt(state.question, snippets, branch_summary, state.global_summary)
-        answer, usage = llm.generate(prompt, max_new_tokens=96, temperature=0.0, name="answer")
+        answer, usage = llm.generate(
+            prompt,
+            max_new_tokens=int(state.budgets.get("final_answer_max_new_tokens", 32)),
+            temperature=0.0,
+            name="answer",
+        )
         state.metrics["llm_calls"] += 1
         step_costs["tokens_used_this_step"] += usage["total_tokens"]
         state.final_answer = answer

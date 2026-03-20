@@ -8,7 +8,8 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
     if not snippets:
         # Fallback: no retrieved evidence
         return (
-            "Answer the following question as concisely as possible (1-5 words).\n\n"
+            "Return ONLY the final answer. Do not explain. Do not add extra words.\n"
+            "Keep the answer as a single short span when possible.\n\n"
             f"Question: {question}\n\n"
             "Answer:"
         )
@@ -26,8 +27,9 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
     # The prompt ends with "Answer:" as the only generation prefix.
     # The model completes directly from here — no template to leak.
     return (
-        "Answer the question using ONLY the evidence snippets provided. "
-        "Be concise — 1 to 5 words only. "
+        "Answer the question using ONLY the evidence snippets provided.\n"
+        "Return ONLY the final answer. Do not explain. Do not add extra words.\n"
+        "Keep the answer as a single short span when possible.\n"
         "Do not add information not present in the snippets.\n\n"
         f"Question: {question}\n"
         f"{context_block}"
