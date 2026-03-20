@@ -21,8 +21,8 @@ def compute_reward(state, action, terminal_correct=None, step_costs=None) -> flo
     reward = 0.0
 
     # Cost penalties
-    reward += -0.0005 * float(step_costs.get("tokens_used_this_step", 0))
-    reward += -0.08 * float(step_costs.get("retrieval_calls_this_step", 0))
+    reward += -0.0003 * float(step_costs.get("tokens_used_this_step", 0))
+    reward += -0.05 * float(step_costs.get("retrieval_calls_this_step", 0))
     reward += -0.06 * float(step_costs.get("new_branch_created", 0))
 
     # Dense progress rewards
@@ -54,9 +54,9 @@ def compute_reward(state, action, terminal_correct=None, step_costs=None) -> flo
     # Terminal reward should dominate.
     if terminal_correct is not None:
         if terminal_correct:
-            reward += 2.5
+            reward += 3.0
             if getattr(state, "verification_status", "unknown") == "supported":
-                reward += 0.25
+                reward += 0.15
             if int(metrics.get("retrieval_calls", 0)) <= 2:
                 reward += 0.10
         else:

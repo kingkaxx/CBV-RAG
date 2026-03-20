@@ -110,6 +110,7 @@ def _flatten_episode(ep: Dict) -> List[Dict]:
     traj_score = float(ep.get("trajectory_score", 0.0))
     terminal_correct = bool(ep.get("terminal_correct", False))
     episode_attr_score = float(ep.get("episode_attr_score", 0.0))
+    il_weight = float(ep.get("il_weight", 1.0))
     num_steps = int(ep.get("num_steps", len(ep.get("trajectory", []))))
     last_t = num_steps - 1
 
@@ -124,6 +125,7 @@ def _flatten_episode(ep: Dict) -> List[Dict]:
             "trajectory_score": traj_score,
             "terminal_correct": terminal_correct,
             "episode_attr_score": episode_attr_score,
+            "il_weight": il_weight,
             "done": t == last_t,
         })
     return rows
@@ -150,16 +152,32 @@ def _process_episode_format(rows: List[Dict], args: argparse.Namespace, out_dir:
         else:
             filtered_episodes += 1
 
-    # Optional: cap traces per qid (keep highest trajectory_score ones).
-    if args.max_traces_per_qid is not None:
-        by_qid: Dict[str, List[Dict]] = defaultdict(list)
-        for ep in kept:
-            by_qid[str(ep.get("qid", "unknown"))].append(ep)
-        capped: List[Dict] = []
-        for eps_for_qid in by_qid.values():
-            eps_for_qid.sort(key=lambda e: float(e.get("trajectory_score", 0.0)), reverse=True)
-            capped.extend(eps_for_qid[: max(1, args.max_traces_per_qid)])
-        kept = capped
+    by_qid: Dict[str, List[Dict]] = defaultdict(list)
+    for ep in kept:
+        by_qid[str(ep.get("qid", "unknown"))].append(ep)
+
+    capped: List[Dict] = []
+    for eps_for_qid in by_qid.values():
+        eps_for_qid.sort(key=lambda e: float(e.get("trajectory_score", 0.0)), reverse=True)
+        correct_eps = [e for e in eps_for_qid if bool(e.get("terminal_correct", False))]
+        wrong_eps = [e for e in eps_for_qid if not bool(e.get("terminal_correct", False))]
+
+        max_correct = args.max_correct_traces_per_qid
+        if max_correct is None and args.max_traces_per_qid is not None:
+            max_correct = args.max_traces_per_qid
+        if max_correct is not None:
+            correct_eps = correct_eps[: max(1, max_correct)]
+
+        max_wrong = args.max_wrong_traces_per_qid
+        if max_wrong is not None:
+            wrong_eps = wrong_eps[: max(0, max_wrong)]
+
+        for ep in correct_eps + wrong_eps:
+            if bool(ep.get("terminal_correct", False)) and args.correct_il_weight > 1.0:
+                ep = dict(ep)
+                ep["il_weight"] = float(args.correct_il_weight)
+            capped.append(ep)
+    kept = capped
 
     # Split by qid BEFORE flattening.
     all_qids = sorted({str(ep.get("qid", "unknown")) for ep in kept})
@@ -225,6 +243,9 @@ def main() -> int:
     ap.add_argument("--max_traces_per_qid", type=int, default=None)
     ap.add_argument("--emit_action_histogram", action="store_true")
     ap.add_argument("--filter_min_trajectory_score", type=float, default=None)
+    ap.add_argument("--max_correct_traces_per_qid", type=int, default=None)
+    ap.add_argument("--max_wrong_traces_per_qid", type=int, default=2)
+    ap.add_argument("--correct_il_weight", type=float, default=1.5)
     args = ap.parse_args()
 
     rows = load_rows(Path(args.input))

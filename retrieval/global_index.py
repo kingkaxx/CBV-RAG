@@ -48,7 +48,8 @@ class GlobalChunkRetriever:
             raise RuntimeError("index not initialized")
         q = self.embedding_model.encode([query], convert_to_numpy=True).astype(np.float32)
         faiss.normalize_L2(q)
-        k = min(max(1, top_k), len(self.rows))
+        search_k = top_k * 5 if dataset_filter else top_k
+        k = min(max(1, search_k), len(self.rows))
         scores, idxs = self.index.search(q, k)
         out = []
         for score, idx in zip(scores[0], idxs[0]):
