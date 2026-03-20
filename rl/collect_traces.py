@@ -1,14 +1,22 @@
+"""collect_traces.py — heuristic controller trace collection.
+
+FIX vs old version:
+- terminal_correct uses normalized EM instead of raw substring match.
+  Old: `any(str(g).strip().lower() in pred_norm for g in golds)`
+       → "no" matches ANY long answer; "the" matches almost everything
+  New: normalized exact match (same as evaluation.py)
+"""
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import string
 from collections import defaultdict
 from pathlib import Path
 
 from cbvrag.actions import get_num_actions
 from cbvrag.controller_trace_mixture import TraceMixtureController
-from cbvrag.evidence_clusters import cluster_evidence_items, summarize_cluster_stats
-from cbvrag.evidence_specificity import score_evidence_specificity
 from cbvrag.runner import run_episode
 from data_loader import load_and_process_data
 from rl.train_offline import shape_reward_with_attr
@@ -19,6 +27,44 @@ from tools.retrieve import RetrieverTool
 import model_loader
 from retriever import KnowledgeBaseRetriever
 
+
+# ---------------------------------------------------------------------------
+# Normalized EM — replaces raw substring match
+# ---------------------------------------------------------------------------
+
+def _normalize(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[%s]" % re.escape(string.punctuation), " ", s)
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    return " ".join(s.split())
+
+
+def _extract_answer(pred: str) -> str:
+    if not pred:
+        return ""
+    pred = re.sub(r"^Answer:\s*", "", pred.strip(), flags=re.IGNORECASE)
+    if "\nReasoning:" in pred:
+        pred = pred.split("\nReasoning:")[0]
+    if "\nAnswer:" in pred:
+        pred = pred.split("\nAnswer:")[0]
+    for line in pred.split("\n"):
+        line = line.strip()
+        if line:
+            return re.sub(r"[.!?]+$", "", line).strip()
+    return pred.strip()
+
+
+def _is_correct(pred: str, golds: list) -> bool:
+    """Normalized exact match — max over gold answers."""
+    pred_norm = _normalize(_extract_answer(pred))
+    if not pred_norm:
+        return False
+    return any(_normalize(str(g)) == pred_norm for g in golds if str(g).strip())
+
+
+# ---------------------------------------------------------------------------
+# Trajectory scoring
+# ---------------------------------------------------------------------------
 
 def _trajectory_score(log: dict, correct: bool) -> float:
     state = (log.get("state") or {})
@@ -70,17 +116,6 @@ def _maybe_clear_temp_index(retriever: KnowledgeBaseRetriever) -> None:
 
 
 def _validate_traces(output_path: Path) -> None:
-    """Print validation statistics for the written JSONL file.
-
-    Checks:
-    - Total episodes written
-    - Unique qids
-    - Records per qid (must be exactly 1.0)
-    - Action value range (min, max — must be within 0..num_actions-1)
-    - Mean episode_attr_score
-    - Mean trajectory_score
-    - % terminal_correct
-    """
     num_actions = get_num_actions()
     records_by_qid: dict[str, int] = defaultdict(int)
     all_action_values: list[int] = []
@@ -133,36 +168,12 @@ def main() -> int:
     ap.add_argument("--cache_dir", default="./huggingface_cache")
     ap.add_argument("--output", default=None)
     ap.add_argument("--num_samples", type=int, default=None)
-    # ---- Attr reward re-scoring ----
-    ap.add_argument(
-        "--use_attr_reward",
-        action="store_true",
-        help=(
-            "Re-score each episode's reward using the Attr-based reward shaping "
-            "from rl/train_offline.py instead of the raw trajectory_score. "
-            "This ensures the IL traces used for behavioural cloning are labelled "
-            "with the same reward the offline RL policy will optimise, making the "
-            "two-stage IL→AWR pipeline self-consistent. "
-            "The 'attr_score' field (from the null-branch arbitration record) is "
-            "read from the episode log; episodes without this field receive 0.0."
-        ),
-    )
-    ap.add_argument(
-        "--attr_lambda_token", type=float, default=0.1,
-        help="Token penalty weight for Attr-shaped reward (default 0.1).",
-    )
-    ap.add_argument(
-        "--attr_lambda_step", type=float, default=0.05,
-        help="Step penalty weight for Attr-shaped reward (default 0.05).",
-    )
-    ap.add_argument(
-        "--attr_bonus", type=float, default=0.2,
-        help="Attribution bonus weight for Attr-shaped reward (default 0.2).",
-    )
-    ap.add_argument(
-        "--token_budget", type=int, default=4096,
-        help="Token budget denominator for normalisation (default 4096).",
-    )
+    ap.add_argument("--use_attr_reward", action="store_true")
+    ap.add_argument("--attr_lambda_token", type=float, default=0.1)
+    ap.add_argument("--attr_lambda_step", type=float, default=0.05)
+    ap.add_argument("--attr_bonus", type=float, default=0.2)
+    ap.add_argument("--token_budget", type=int, default=4096)
+    ap.add_argument("--llm_device", default="cuda:0")
     args = ap.parse_args()
 
     output = Path(args.output or f"data/traces/{args.dataset}.jsonl")
@@ -171,13 +182,6 @@ def main() -> int:
     models = model_loader.load_all_models()
     retriever = KnowledgeBaseRetriever(models["embedding_model"])
 
-    if args.dataset == "arc_c":
-        try:
-            if hasattr(retriever, "load_index"):
-                retriever.load_index()
-        except Exception as e:
-            print(f"Warning: failed to load global index for dataset={args.dataset}: {e}", flush=True)
-
     tools = {
         "llm": LLMEngine(
             model_name_or_path=getattr(
@@ -185,7 +189,7 @@ def main() -> int:
                 "name_or_path",
                 models["llm_model"].config._name_or_path,
             ),
-            device="cuda:0",
+            device=args.llm_device,
         ),
         "retrieve": RetrieverTool(retriever),
         "rerank": CrossEncoderReranker(),
@@ -193,7 +197,6 @@ def main() -> int:
 
     data = load_and_process_data(args.dataset, args.cache_dir, args.num_samples)
 
-    # Accumulators for summary statistics.
     summary_em: list = []
     summary_tokens: list = []
     summary_attr: list = []
@@ -209,23 +212,22 @@ def main() -> int:
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
 
             golds = ex.get("answer") or [""]
-            pred_norm = pred.strip().lower()
-            correct = any(str(g).strip().lower() in pred_norm for g in golds if str(g).strip())
+
+            # FIX: use normalized EM not substring match
+            correct = _is_correct(pred, golds)
+
             traj_score = _trajectory_score(log, correct)
 
-            # Extract episode-level Attr score from null-branch arbitration record.
             null_branch_record = log.get("null_branch") or {}
             attr_result = null_branch_record.get("attr_score") or {}
             episode_attr_score = float(attr_result.get("attr", 0.0))
 
-            # Token usage for this episode (sum over all steps).
             step_logs = log.get("steps", [])
             episode_tokens = sum(
                 int((s.get("costs") or {}).get("tokens_used_this_step", 0))
                 for s in step_logs
             )
 
-            # Build the episode-level trajectory list — one entry per step.
             trajectory = []
             for t, tr in enumerate(controller.trace):
                 step_info = step_logs[t] if t < len(step_logs) else {}
@@ -256,7 +258,6 @@ def main() -> int:
                     "step_info": step_info,
                 })
 
-            # One record per episode — exactly one line per unique qid.
             episode_record = {
                 "qid": qid,
                 "question": ex["question"],
@@ -270,14 +271,12 @@ def main() -> int:
             }
             f.write(json.dumps(episode_record) + "\n")
 
-            # Accumulate summary stats once per episode (at episode boundary).
             summary_em.append(1.0 if correct else 0.0)
             summary_tokens.append(episode_tokens)
             summary_attr.append(episode_attr_score)
 
     _maybe_clear_temp_index(retriever)
 
-    # Print summary statistics so operators can verify trace quality.
     n = max(1, len(summary_em))
     summary = {
         "dataset": args.dataset,
@@ -289,9 +288,7 @@ def main() -> int:
     }
     print(json.dumps(summary, indent=2))
 
-    # Validate the written file and print a diagnostics report.
     _validate_traces(output)
-
     return 0
 
 

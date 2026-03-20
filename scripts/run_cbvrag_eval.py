@@ -11,8 +11,42 @@ from data_loader import load_and_process_data
 
 
 # ---------------------------------------------------------------------------
-# Standard HotpotQA / SQuAD EM + F1 — self-contained so the script doesn't
-# depend on the project's evaluation.py implementation.
+# Answer extraction — applied BEFORE EM/F1 scoring
+# ---------------------------------------------------------------------------
+
+def extract_answer(pred: str) -> str:
+    """Extract the answer span from a raw LLM output.
+
+    Handles three output formats produced by answer_prompt():
+      1. Clean: "Paris"
+      2. With reasoning suffix: "Paris\nReasoning: ..."
+      3. With Answer: prefix repeated: "Answer: Paris\nReasoning: ..."
+
+    Returns the shortest clean answer string for EM comparison.
+    """
+    if not pred:
+        return ""
+
+    # Strip "Answer:" prefix if the model echoed it
+    pred = re.sub(r"^Answer:\s*", "", pred.strip(), flags=re.IGNORECASE)
+
+    # Take everything before the first Reasoning: block
+    if "\nReasoning:" in pred:
+        pred = pred.split("\nReasoning:")[0]
+
+    # Take the first non-empty line
+    for line in pred.split("\n"):
+        line = line.strip()
+        if line:
+            # Strip any trailing punctuation artifact
+            line = re.sub(r"[.!?]+$", "", line).strip()
+            return line
+
+    return pred.strip()
+
+
+# ---------------------------------------------------------------------------
+# Standard HotpotQA / SQuAD EM + F1
 # ---------------------------------------------------------------------------
 
 def normalize_answer(s: str) -> str:
@@ -37,18 +71,19 @@ def token_f1(pred: str, gold: str) -> float:
 
 
 def compute_metrics(pred: str, golds: list[str]) -> tuple[float, float]:
-    """Return (EM, F1) for a prediction against a list of gold answers.
+    """Return (EM, F1) using extracted answer.
 
-    Uses first 150 characters of *pred* to avoid penalising reasoning chains
-    (HotpotQA answers are 1-5 words; longer strings confuse token overlap).
-    Takes the max over all gold answers.
+    FIX vs old version:
+    - extract_answer() is applied BEFORE normalization (not 150-char truncation)
+    - same extracted string used for both EM and F1
+    - F1 is now always >= EM (mathematically correct)
     """
-    pred_short = pred[:150] if pred else ""
+    pred_clean = extract_answer(pred)
     em = max(
-        float(normalize_answer(pred_short) == normalize_answer(g))
+        float(normalize_answer(pred_clean) == normalize_answer(g))
         for g in golds
     ) if golds else 0.0
-    f1 = max(token_f1(pred_short, g) for g in golds) if golds else 0.0
+    f1 = max(token_f1(pred_clean, g) for g in golds) if golds else 0.0
     return em, f1
 
 
@@ -78,7 +113,6 @@ def _build_controller(args):
     if ct == "heuristic":
         from cbvrag.controller_trace_mixture import TraceMixtureController
         return TraceMixtureController()
-    # il / offline — both use the learned controller
     if not args.policy_ckpt:
         raise ValueError("--policy_ckpt is required for controller_type il/offline")
     from cbvrag.controller_learned import LearnedController
@@ -92,24 +126,18 @@ def main() -> int:
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--cache_dir", default="./huggingface_cache")
     ap.add_argument("--output", default="logs/cbvrag_eval.json")
-    ap.add_argument("--baseline_jsonl", default=None,
-                    help="Optional path to a CF-RAG baseline JSONL for side-by-side comparison.")
-    # Controller selection
+    ap.add_argument("--baseline_jsonl", default=None)
     ap.add_argument("--controller_type", choices=["heuristic", "il", "offline"],
                     default="heuristic")
-    ap.add_argument("--policy_ckpt", default=None,
-                    help="Path to .pt checkpoint (required for il/offline).")
+    ap.add_argument("--policy_ckpt", default=None)
     ap.add_argument("--policy_mode", choices=["greedy", "sample"], default="greedy")
-    # Runtime
     ap.add_argument("--llm_device", default="cuda:0")
     ap.add_argument("--num_samples", type=int, default=None)
     ap.add_argument(
         "--use_oracle_context", action="store_true",
         help=(
             "Before each episode, build a temporary retrieval index from the "
-            "example's gold 'context' field (same as run_evaluation.py). "
-            "This matches CF-RAG's eval setting where the retriever operates "
-            "over gold supporting documents rather than the global index."
+            "example's gold 'context' field. Matches CF-RAG's eval setting."
         ),
     )
     args = ap.parse_args()
@@ -117,7 +145,7 @@ def main() -> int:
     import model_loader
     models = model_loader.load_all_models()
     tools = _build_tools(models, args.llm_device)
-    retriever = tools["retrieve"].retriever  # KnowledgeBaseRetriever instance
+    retriever = tools["retrieve"].retriever
     data = load_and_process_data(args.dataset, args.cache_dir, args.num_samples)
 
     per_example_records = []
@@ -130,11 +158,11 @@ def main() -> int:
 
         controller = _build_controller(args)
         final_answer, log = run_episode(ex["question"], controller, tools, qid=str(i))
-        # BUG 1 fix: ensure we always have a non-None string from run_episode.
         pred = (final_answer or "").strip()
 
         golds = ex.get("answer") or [""]
-        # BUG 2 fix: use standard HotpotQA EM/F1 with 150-char truncation.
+
+        # FIX: extract_answer before scoring — same string for EM and F1
         em, f1 = compute_metrics(pred, golds)
 
         state = log.get("state") or {}
@@ -154,6 +182,7 @@ def main() -> int:
             "qid": str(i),
             "question": ex["question"],
             "prediction": pred,
+            "prediction_extracted": extract_answer(pred),  # stored for debugging
             "gold_answers": golds,
             "em": float(em),
             "f1": float(f1),
@@ -196,7 +225,6 @@ def main() -> int:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # One line per example alongside the main JSON.
     records_path = output_path.with_name(output_path.stem + ".records.jsonl")
     with records_path.open("w", encoding="utf-8") as f:
         for r in per_example_records:

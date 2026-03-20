@@ -54,21 +54,38 @@ class LLMEngine:
     ) -> Tuple[str, dict]:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         prompt_len = int(inputs["input_ids"].shape[-1])
+
         gen_kwargs = {
             "max_new_tokens": max_new_tokens or self.max_new_tokens,
             "top_p": top_p,
             "pad_token_id": self.tokenizer.pad_token_id,
             "do_sample": temperature > 0,
+            # FIX: prevent repetition loops (Kevin Spacey bug)
+            "repetition_penalty": 1.3,
+            "no_repeat_ngram_size": 4,
         }
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
+
         with torch.no_grad():
             outputs = self.model.generate(**inputs, **gen_kwargs)
+
         generated_ids = outputs[0]
         completion_ids = generated_ids[prompt_len:]
         text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+
         if stop and stop in text:
             text = text.split(stop)[0]
+
+        # FIX: strip at first newline for answer-style prompts that end with "Answer:"
+        # This prevents "Answer: Paris\nReasoning: ..." from being returned in full.
+        # Only strip if the decoded text looks like a multi-line answer+reasoning block.
+        if "\nReasoning:" in text:
+            text = text.split("\nReasoning:")[0]
+        elif "\nAnswer:" in text:
+            # model repeated the Answer: prefix — take only first answer
+            text = text.split("\nAnswer:")[0]
+
         usage_record = self.usage_tracker.track(
             name=name,
             prompt_tokens=prompt_len,
