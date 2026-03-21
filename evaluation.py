@@ -39,11 +39,27 @@ def exact_match_score(prediction, ground_truth):
     return normalized_ground_truth in normalized_prediction
 
 def smart_match(ground_truth, prediction, question=""):
-    gt_lower = ground_truth.lower().strip()
-    pred_lower = prediction.lower().strip()
+    import re, unicodedata
+    def _norm(s):
+        # Unicode normalize (André -> Andre)
+        s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+        s = s.lower().strip()
+        # collapse whitespace and remove internal spaces around punctuation
+        s = re.sub(r'\s+', ' ', s)
+        return s
+
+    gt_lower = _norm(ground_truth)
+    pred_lower = _norm(prediction)
     question_lower = question.lower()
-    
+
+    # Direct containment check (normalized)
     if gt_lower in pred_lower:
+        return True
+    
+    # Space-collapsed match: "GatwickAirport" matches "Gatwick Airport"
+    gt_nospace = gt_lower.replace(" ", "")
+    pred_nospace = pred_lower.replace(" ", "")
+    if gt_nospace and gt_nospace in pred_nospace:
         return True
     
     if gt_lower == "yes":
