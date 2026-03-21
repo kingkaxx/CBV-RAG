@@ -116,7 +116,7 @@ def compute_metrics(pred: str, golds: list[str], question: str) -> tuple[float, 
 
     pred_clean = extract_answer(pred)
     em = max(
-        float(smart_exact_match_score(pred_clean, g, question))
+        float(smart_exact_match_score(pred, g, question))  # full pred for containment
         for g in golds
     ) if golds else 0.0
     f1 = max(token_f1(pred_clean, g) for g in golds) if golds else 0.0
