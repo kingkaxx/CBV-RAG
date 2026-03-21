@@ -261,3 +261,13 @@ RERANK_BATCH_SIZE = 32
 CBVRAG_MAX_STEPS = 8
 CBVRAG_MAX_BRANCHES = 3
 CBVRAG_MAX_RETRIEVAL_CALLS = 5
+
+# ── Attr-adaptive multi-draft answer generation ──────────────────────────────
+# When 0 < Attr < MULTIDRAFT_ATTR_THRESHOLD, evidence grounding is uncertain.
+# Generate NUM_ANSWER_DRAFTS candidate answers and pick best by NLI entailment.
+# Threshold=0.60 chosen from trace analysis: attr is bimodal (41% zero, rest 0.6+)
+# so 0.60 captures the uncertain middle band without wasting compute on hopeless
+# zero-attr episodes or high-confidence episodes.
+MULTIDRAFT_ATTR_THRESHOLD = 0.60
+NUM_ANSWER_DRAFTS = 3
+MULTIDRAFT_MIN_ATTR = 0.01  # skip multi-draft if attr==0 (no evidence retrieved)
