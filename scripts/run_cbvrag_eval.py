@@ -245,6 +245,8 @@ def main() -> int:
                 "retrieval_calls": int(metrics.get("retrieval_calls", 0)),
                 "attr_score": attr_score,
                 "parametric_hallucination_risk": parametric_risk,
+                "multidraft_used": int(metrics.get("multidraft_used", 0)),
+                "multidraft_attr": float(metrics.get("multidraft_attr", 0.0)),
             })
         n = max(1, len(per_example_records))
         summary = {
