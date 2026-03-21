@@ -295,15 +295,78 @@ def execute_action(state: EpisodeState, action: Action, controller: Any, tools: 
         snippets = _selected_snippets(state)
         branch_summary = getattr(state.branches[state.active_branch_id], "summary", "")
         prompt = answer_prompt(state.question, snippets, branch_summary, state.global_summary)
-        answer, usage = llm.generate(
-            prompt,
-            max_new_tokens=int(state.budgets.get("final_answer_max_new_tokens", 32)),
-            temperature=0.0,
-            name="answer",
+        max_new_tok = int(state.budgets.get("final_answer_max_new_tokens", 32))
+
+        # ── Attr-adaptive multi-draft answer generation ───────────────────
+        try:
+            import config as _cfg
+            _threshold  = float(getattr(_cfg, "MULTIDRAFT_ATTR_THRESHOLD", 0.60))
+            _min_attr   = float(getattr(_cfg, "MULTIDRAFT_MIN_ATTR", 0.01))
+            _num_drafts = int(getattr(_cfg, "NUM_ANSWER_DRAFTS", 3))
+        except Exception:
+            _threshold, _min_attr, _num_drafts = 0.60, 0.01, 3
+
+        _doc_texts = [
+            state.evidence_pool[eid].short_claim
+            for eid in state.selected_evidence_ids
+            if eid in state.evidence_pool
+        ]
+
+        # Inline Attr for gating decision
+        _inline_attr = 0.0
+        if _doc_texts:
+            try:
+                from cbvrag.attribution import grounded_directness
+                _inline_attr = grounded_directness(state.question, _doc_texts)
+            except Exception as _e:
+                logger.warning("inline attr failed: %s", _e)
+        state.metrics["last_attr_score"] = float(_inline_attr)
+
+        # Gate: multi-draft only when attr is in uncertain middle band
+        _use_multidraft = (
+            _inline_attr >= _min_attr
+            and _inline_attr < _threshold
+            and len(_doc_texts) > 0
+            and _num_drafts > 1
         )
-        state.metrics["llm_calls"] += 1
-        step_costs["tokens_used_this_step"] += usage["total_tokens"]
-        state.final_answer = answer
+
+        if _use_multidraft:
+            from cbvrag.attribution import grounded_directness
+            _drafts, _draft_scores = [], []
+            for _di in range(_num_drafts):
+                _temp = 0.0 if _di == 0 else 0.4
+                _draft, _draft_usage = llm.generate(
+                    prompt, max_new_tokens=max_new_tok,
+                    temperature=_temp, name=f"answer_draft_{_di}",
+                )
+                state.metrics["llm_calls"] += 1
+                step_costs["tokens_used_this_step"] += _draft_usage["total_tokens"]
+                _drafts.append(_draft.strip())
+                _score = grounded_directness(
+                    state.question, _doc_texts, answer_text=_draft.strip()
+                )
+                _draft_scores.append(_score)
+                logger.debug("multidraft %d/%d score=%.4f answer=%r",
+                             _di+1, _num_drafts, _score, _draft[:60])
+            _best_idx = _draft_scores.index(max(_draft_scores))
+            state.final_answer = _drafts[_best_idx]
+            state.metrics["multidraft_used"]       = 1
+            state.metrics["multidraft_best_score"] = float(_draft_scores[_best_idx])
+            state.metrics["multidraft_attr"]       = float(_inline_attr)
+            logger.info("multidraft: picked %d/%d scores=%s answer=%r",
+                        _best_idx+1, _num_drafts,
+                        [f"{s:.3f}" for s in _draft_scores],
+                        state.final_answer[:60])
+        else:
+            answer, usage = llm.generate(
+                prompt, max_new_tokens=max_new_tok,
+                temperature=0.0, name="answer",
+            )
+            state.metrics["llm_calls"] += 1
+            step_costs["tokens_used_this_step"] += usage["total_tokens"]
+            state.final_answer = answer
+            state.metrics["multidraft_used"] = 0
+        # ─────────────────────────────────────────────────────────────────
 
     elif action == Action.PRUNE_BRANCH and len(state.branches) > 1:
         victim = None
