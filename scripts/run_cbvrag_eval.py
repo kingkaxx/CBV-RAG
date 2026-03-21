@@ -182,6 +182,22 @@ def main() -> int:
         help="Run eval twice and print side-by-side summary: normal retrieval vs oracle context.",
     )
     ap.add_argument(
+        "--no_multidraft", action="store_true",
+        help="Disable Attr-adaptive multi-draft answer generation.",
+    )
+    ap.add_argument(
+        "--attr_threshold", type=float, default=None,
+        help="Override MULTIDRAFT_ATTR_THRESHOLD from config.py.",
+    )
+    ap.add_argument(
+        "--min_attr", type=float, default=None,
+        help="Override MULTIDRAFT_MIN_ATTR from config.py.",
+    )
+    ap.add_argument(
+        "--num_drafts", type=int, default=None,
+        help="Override NUM_ANSWER_DRAFTS from config.py.",
+    )
+    ap.add_argument(
         "--use_oracle_context", action="store_true",
         help=(
             "Before each episode, build a temporary retrieval index from the "
@@ -191,6 +207,17 @@ def main() -> int:
     args = ap.parse_args()
 
     import model_loader
+
+    # Apply CLI overrides to config before loading tools
+    import config as _cfg
+    if args.no_multidraft:
+        _cfg.NUM_ANSWER_DRAFTS = 1  # disables multidraft in runner.py
+    if args.attr_threshold is not None:
+        _cfg.MULTIDRAFT_ATTR_THRESHOLD = args.attr_threshold
+    if args.min_attr is not None:
+        _cfg.MULTIDRAFT_MIN_ATTR = args.min_attr
+    if args.num_drafts is not None:
+        _cfg.NUM_ANSWER_DRAFTS = args.num_drafts
 
     models = model_loader.load_all_models()
     tools = _build_tools(models, args.llm_device)
