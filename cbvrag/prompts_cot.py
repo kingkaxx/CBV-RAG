@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from typing import Iterable
 
 
@@ -9,8 +8,6 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         return (
             "Answer the following question as concisely as possible.\n\n"
             f"Question: {question}\n\n"
-            "Write your answer in 1-5 words only.\n"
-            "You MUST end with: Answer: <answer>\n\n"
             "Answer:"
         )
 
@@ -21,7 +18,7 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         context_parts.append(f"Additional context: {branch_summary.strip()}")
     if (global_summary or "").strip():
         context_parts.append(f"Summary: {global_summary.strip()}")
-    context_block = ("\n" + "\n".join(context_parts) + "\n") if context_parts else ""
+    context_block = ("\n" + "\n".join(context_parts) + "\n") if context_parts else "\n"
 
     return (
         "You are a precise question answering system.\n"
@@ -29,11 +26,9 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         f"Evidence:\n{evidence_text}\n"
         f"{context_block}\n"
         f"Question: {question}\n\n"
-        "Step 1 - Find relevant facts from the evidence:\n"
-        "Step 2 - Connect the facts to answer the question:\n"
-        "Step 3 - Write ONLY the final answer in 1-5 words.\n\n"
-        "You MUST end your response with exactly this format:\n"
-        "Answer: <your concise answer>\n\n"
+        "Step 1 - Key facts from evidence:\n"
+        "Step 2 - Reasoning:\n"
+        "Step 3 - Final answer (1-5 words):\n"
         "Answer:"
     )
 

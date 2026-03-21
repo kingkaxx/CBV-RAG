@@ -52,7 +52,16 @@ class LLMEngine:
         stop: Optional[str] = None,
         name: str = "llm.generate",
     ) -> Tuple[str, dict]:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        # Apply chat template if available (required for Qwen3 instruct models)
+        if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
+            messages = [{"role": "user", "content": prompt}]
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False  # Disable Qwen3 CoT thinking tokens
+            )
+        else:
+            formatted = prompt
+        inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
         prompt_len = int(inputs["input_ids"].shape[-1])
 
         gen_kwargs = {
@@ -64,6 +73,10 @@ class LLMEngine:
             "repetition_penalty": 1.3,
             "no_repeat_ngram_size": 4,
         }
+        # Disable Qwen3 thinking mode — keeps output concise and avoids token budget issues
+        if hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template:
+            gen_kwargs["temperature"] = 0.0 if temperature == 0 else temperature
+            gen_kwargs["do_sample"] = False
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
 
@@ -72,10 +85,22 @@ class LLMEngine:
 
         generated_ids = outputs[0]
         completion_ids = generated_ids[prompt_len:]
-        text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+        text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+        # Strip Qwen3 thinking blocks from decoded output
+        import re
+        text = re.sub(r"<\|im_start\|>.*?<\|im_end\|>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", "", text)  # strip any remaining special tokens
+        text = text.strip()
 
-        if stop and stop in text:
-            text = text.split(stop)[0]
+        # Stop string handling — support single string or list
+        stop_list = [stop] if isinstance(stop, str) else (stop or [])
+        # Qwen3 CoT: always stop at second-attempt markers
+        stop_list += ["Okay, let me try", "Wait—actually", "Let me reconsider",
+                      "Hmm,", "Actually,", "\n\nOkay"]
+        for s in stop_list:
+            if s and s in text:
+                text = text.split(s)[0]
 
         # FIX: strip at first newline for answer-style prompts that end with "Answer:"
         # This prevents "Answer: Paris\nReasoning: ..." from being returned in full.

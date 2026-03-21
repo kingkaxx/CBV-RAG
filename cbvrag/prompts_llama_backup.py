@@ -9,8 +9,6 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         return (
             "Answer the following question as concisely as possible.\n\n"
             f"Question: {question}\n\n"
-            "Write your answer in 1-5 words only.\n"
-            "You MUST end with: Answer: <answer>\n\n"
             "Answer:"
         )
 
@@ -31,9 +29,7 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         f"Question: {question}\n\n"
         "Step 1 - Find relevant facts from the evidence:\n"
         "Step 2 - Connect the facts to answer the question:\n"
-        "Step 3 - Write ONLY the final answer in 1-5 words.\n\n"
-        "You MUST end your response with exactly this format:\n"
-        "Answer: <your concise answer>\n\n"
+        "Step 3 - Final answer (1-5 words only):\n"
         "Answer:"
     )
 

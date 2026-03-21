@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-LLM_MODEL_ID = "/scratch/yl258/kp759/hf/models--Qwen--Qwen3-32B"
+LLM_MODEL_ID = "/scratch/yl258/kp759/hf/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 RERANKER_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-reranker-large-local"
 EMBEDDING_MODEL_ID = "/scratch/yl258/kp759/hf/model_cache/bge-large-en-v1.5-local"
 NLI_MODEL_ID = "microsoft/deberta-large-mnli"
