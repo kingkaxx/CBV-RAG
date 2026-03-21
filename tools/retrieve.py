@@ -15,15 +15,26 @@ class RetrieverTool:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.dataset_filter = dataset_filter
+        self.disable_cache = False
+        self.cache_namespace = "default"
 
     def _cache_key(self, query: str, pool_k: int, mode: str) -> str:
-        raw = json.dumps({"q": query, "k": pool_k, "m": mode, "dataset_filter": self.dataset_filter}, sort_keys=True)
+        raw = json.dumps(
+            {
+                "q": query,
+                "k": pool_k,
+                "m": mode,
+                "dataset_filter": self.dataset_filter,
+                "cache_namespace": self.cache_namespace,
+            },
+            sort_keys=True,
+        )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def retrieve(self, query: str, pool_k: int, mode: str = "dense") -> List[Candidate]:
         key = self._cache_key(query, pool_k, mode)
         cache_file = self.cache_dir / f"{key}.json"
-        if cache_file.exists():
+        if (not self.disable_cache) and cache_file.exists():
             return json.loads(cache_file.read_text(encoding="utf-8"))
 
         try:
@@ -60,5 +71,6 @@ class RetrieverTool:
                 }
             )
 
-        cache_file.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
+        if not self.disable_cache:
+            cache_file.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
         return candidates

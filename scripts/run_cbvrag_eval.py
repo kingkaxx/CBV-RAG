@@ -116,7 +116,7 @@ def compute_metrics(pred: str, golds: list[str], question: str) -> tuple[float, 
 
     pred_clean = extract_answer(pred)
     em = max(
-        float(evaluation.smart_exact_match_score(pred_clean, g, question))
+        float(smart_exact_match_score(pred_clean, g, question))
         for g in golds
     ) if golds else 0.0
     f1 = max(token_f1(pred_clean, g) for g in golds) if golds else 0.0
@@ -194,6 +194,11 @@ def main() -> int:
 
     models = model_loader.load_all_models()
     tools = _build_tools(models, args.llm_device)
+    if args.use_oracle_context:
+        tools["retrieve"].disable_cache = True
+        tools["retrieve"].cache_namespace = "oracle"
+    else:
+        tools["retrieve"].cache_namespace = "kb"
     retriever = tools["retrieve"].retriever
     data = load_and_process_data(args.dataset, args.cache_dir, args.num_samples)
 
