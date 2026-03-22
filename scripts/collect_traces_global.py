@@ -110,6 +110,7 @@ def main() -> int:
     ap.add_argument("--attr_lambda_step", type=float, default=0.05)
     ap.add_argument("--attr_bonus", type=float, default=0.2)
     ap.add_argument("--token_budget", type=int, default=4096)
+    ap.add_argument("--use_oracle_context", action="store_true")
     args = ap.parse_args()
 
     output = Path(args.output or f"data/traces/{args.dataset}.jsonl")
@@ -150,11 +151,17 @@ def main() -> int:
         for i, ex in enumerate(data):
             qid = str(ex.get("qid", i))
             controller = TraceMixtureController(seed=1000 + i)
+            if args.use_oracle_context:
+                context_docs = ex.get("context")
+                if context_docs:
+                    retriever.build_temp_index_from_docs(context_docs)
             pred, log = run_episode(ex["question"], controller, tools, qid=qid)
+            if args.use_oracle_context:
+                retriever.clear_temp_index()
 
             golds = ex.get("answers") or [""]
-            pred_norm = pred.strip().lower()
-            correct = any(str(g).strip().lower() in pred_norm for g in golds if str(g).strip())
+            from cbvrag.env import _extract_answer, _any_em_correct
+            correct = _any_em_correct(pred, golds)
             traj_score = _trajectory_score(log, correct)
 
             null_branch_record = log.get("null_branch") or {}

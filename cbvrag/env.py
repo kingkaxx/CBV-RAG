@@ -28,31 +28,28 @@ def _normalize(s: str) -> str:
 
 
 def _extract_answer(pred: str) -> str:
-    """Extract the answer span from raw LLM output.
-
-    FIX: Old code used `gold.strip().lower() in pred` which is a raw substring
-    match on the full unprocessed output. This caused two bugs:
-      1. Template text matching gold ("1755" never in "...[your concise answer]...")
-         → always False, EM=0 even when correct
-      2. Short gold strings matching anywhere in a long prediction
-         → False positives (e.g. "no" in any long negative answer)
-    """
+    """Extract concise answer, stripping Qwen3 CoT blocks."""
+    import re
     if not pred:
-        return ""
-    # Strip echoed "Answer:" prefix
-    pred = re.sub(r"^Answer:\s*", "", pred.strip(), flags=re.IGNORECASE)
-    # Drop Reasoning block
-    if "\nReasoning:" in pred:
-        pred = pred.split("\nReasoning:")[0]
-    if "\nAnswer:" in pred:
-        pred = pred.split("\nAnswer:")[0]
-    # First non-empty line
-    for line in pred.split("\n"):
-        line = line.strip()
-        if line:
-            return re.sub(r"[.!?]+$", "", line).strip()
-    return pred.strip()
-
+        return ''
+    pred = re.sub(r'<think>.*?</think>', '', pred, flags=re.DOTALL)
+    pred = re.sub(r'<[^>]{1,30}>', '', pred)
+    pred = pred.strip()
+    if not pred:
+        return ''
+    # Last Answer: line
+    import re as _re
+    hits = _re.findall(r'(?:final answer|answer)\s*:\s*([^\n]{2,80})', pred, _re.IGNORECASE)
+    if hits:
+        val = hits[-1].strip()
+        if val and not _re.match(r'^step\s*\d|^reasoning', val, _re.IGNORECASE):
+            return _re.sub(r'[.!?]+$', '', val).strip()
+    # Last short non-header line
+    ls = [l.strip() for l in pred.splitlines() if l.strip()]
+    for l in reversed(ls):
+        if 2 < len(l) < 80 and not _re.match(r'^step|^reason|^based|^therefore|^[-=*]{2}', l, _re.IGNORECASE):
+            return _re.sub(r'[.!?]+$', '', l).strip()
+    return _re.sub(r'[.!?]+$', '', ls[-1]).strip() if ls else ''
 
 def _em_correct(pred: str, gold: str) -> bool:
     """Exact match after normalization — used for terminal reward signal."""
@@ -60,12 +57,12 @@ def _em_correct(pred: str, gold: str) -> bool:
 
 
 def _any_em_correct(pred: str, golds) -> bool:
-    """Max-over-golds EM, handles both str and list gold."""
+    """Max-over-golds smart EM."""
+    from evaluation import smart_exact_match_score
     if isinstance(golds, str):
         golds = [golds]
-    pred_norm = _normalize(_extract_answer(pred))
-    return any(pred_norm == _normalize(str(g)) for g in golds if str(g).strip())
-
+    pred_clean = _extract_answer(pred)
+    return any(bool(smart_exact_match_score(pred_clean, str(g), '')) for g in golds if str(g).strip())
 
 # ---------------------------------------------------------------------------
 # Environment
