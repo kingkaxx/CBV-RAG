@@ -34,7 +34,7 @@ class GlobalIndexAdapter:
         import faiss
         from sentence_transformers import SentenceTransformer
         self.index_dir = Path(index_dir)
-        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        self.embedding_model = SentenceTransformer("/scratch/yl258/kp759/hf/model_cache/bge-large-en-v1.5-local")
         self.index = faiss.read_index(str(self.index_dir / "global.index"))
         self.rows = load_jsonl(kb_jsonl)
 
@@ -42,8 +42,46 @@ class GlobalIndexAdapter:
         emb = self.embedding_model.encode([query], convert_to_numpy=True)
         return np.asarray(emb, dtype="float32")
 
+    def build_temp_index_from_docs(self, context_docs) -> None:
+        """Build temporary oracle index from gold context docs."""
+        import faiss, numpy as np
+        texts = []
+        if isinstance(context_docs, list):
+            for item in context_docs:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # HotpotQA format: [title, [sent1, sent2, ...]]
+                    sents = item[1] if isinstance(item[1], list) else [item[1]]
+                    texts.append(" ".join(sents))
+                elif isinstance(item, dict):
+                    texts.append(item.get("text", str(item)))
+        if not texts:
+            return
+        embs = self.embedding_model.encode(texts, convert_to_numpy=True).astype("float32")
+        dim = embs.shape[1]
+        self._temp_index = faiss.IndexFlatL2(dim)
+        self._temp_index.add(embs)
+        self._temp_docs = texts
+
+    def clear_temp_index(self) -> None:
+        self._temp_index = None
+        self._temp_docs = []
+
     def search(self, query: str, top_k: int = 10, dataset_filter: str | None = None) -> List[Dict[str, Any]]:
         q = self._embed(query)
+        if getattr(self, "_temp_index", None) is not None:
+            scores, ids = self._temp_index.search(q, min(top_k, self._temp_index.ntotal))
+            out = []
+            for score, idx in zip(scores[0], ids[0]):
+                if idx < 0 or idx >= len(self._temp_docs):
+                    continue
+                out.append({"doc_id": str(idx), "chunk_id": str(idx),
+                            "text": self._temp_docs[int(idx)], "score": float(score),
+                            "retriever_score": float(score), "title": "", "dataset": "", "meta": {}})
+                if len(out) >= top_k:
+                    break
+            return out
         scores, ids = self.index.search(q, top_k * 5 if dataset_filter else top_k)
 
         out: List[Dict[str, Any]] = []

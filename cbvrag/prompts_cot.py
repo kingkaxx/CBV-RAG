@@ -8,7 +8,6 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         return (
             "Answer the following question as concisely as possible.\n\n"
             f"Question: {question}\n\n"
-            "Answer:"
         )
 
     evidence_text = "\n".join([f"[{i+1}] {s}" for i, s in enumerate(snippets)])
@@ -26,10 +25,7 @@ def answer_prompt(question: str, selected_snippets: Iterable[str], branch_summar
         f"Evidence:\n{evidence_text}\n"
         f"{context_block}\n"
         f"Question: {question}\n\n"
-        "Step 1 - Key facts from evidence:\n"
-        "Step 2 - Reasoning:\n"
-        "Step 3 - Final answer (1-5 words):\n"
-        "Answer:"
+        "Answer (1-5 words only):"
     )
 
 

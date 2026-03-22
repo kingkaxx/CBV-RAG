@@ -41,6 +41,7 @@ def main() -> int:
 
     records = []
     for i, ex in enumerate(data):
+        cost = CostTracker()
         qid = str(ex.get("id", i))
         q = ex["question"]
         golds = ex["answer"]
